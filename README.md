@@ -103,6 +103,8 @@ npx zeabur@latest ai-hub keys create --alias "news-bot" -i=false
 
 **拿到:** AI Hub 金鑰(`sk-...`)。端點:`https://hnd1.aihub.zeabur.ai/v1`(東京),模型用 `claude-sonnet-4-5`。
 
+> 💡 **為什麼變數叫 `OPENAI_*`?** AI Hub 提供「OpenAI 相容介面」,所以程式用 OpenAI 的 SDK、把網址指到 AI Hub。**實際呼叫到的是 Claude**,名字只是介面慣例,跟 OpenAI/GPT 無關。
+
 ---
 
 ## 步驟四:租伺服器 + 部署到 Zeabur
@@ -222,7 +224,7 @@ npx zeabur@latest service restart --id <SERVICE_ID> -y -i=false
 - 「只丟連結就自動抓全文」分析(需接抓網頁服務)
 - 加「概念股主表」自動比對標籤
 - 把其他專案也部署到同一台伺服器
-- 換成 Anthropic 官方 API(只要改 `OPENAI_BASE_URL` 和金鑰)
+- 改用 **Anthropic 官方 API 直連 Claude**(目前是透過 Zeabur AI Hub 呼叫 Claude;若想直連官方,只要改 `OPENAI_BASE_URL` 與金鑰即可——**用的同樣是 Claude,只是換呼叫管道與結帳對象**)
 
 ---
 
