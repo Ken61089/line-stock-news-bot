@@ -226,4 +226,13 @@ npx zeabur@latest service restart --id <SERVICE_ID> -y -i=false
 
 ---
 
-*本 SOP 由實作過程整理而成。歡迎 fork、改造、分享。*
+## 授權與使用規範
+
+本 SOP 由 **Ken Hung** 於實作過程中整理而成。歡迎 fork、改造、分享,但請遵守以下原則:
+
+- **註明出處**:使用或轉載時,請標明原作者(Ken Hung)與本專案連結。
+- **非商業使用**:請勿用於營利用途。
+- **請勿據為己有**:不得移除出處、把本內容當作自己的原創再行散布。
+- **尊重智慧財產權**:本文涉及的第三方服務(Google、LINE、Zeabur、Anthropic 等)商標與權利,皆屬各自所有者。
+
+> 概念上等同 [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)(姓名標示—非商業性)。感謝你的善意使用 🙏
