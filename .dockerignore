@@ -1,0 +1,8 @@
+.venv/
+venv/
+.env
+credentials.json
+__pycache__/
+*.pyc
+.git/
+_test_news.txt

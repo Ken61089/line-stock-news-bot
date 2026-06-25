@@ -1,0 +1,7 @@
+line-bot-sdk>=3.14
+flask>=3.0
+waitress>=3.0
+openai>=1.54
+gspread>=6.1
+google-auth>=2.35
+pydantic>=2.9

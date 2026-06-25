@@ -1,0 +1,11 @@
+.env
+credentials.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+_test_news.txt
+
+# 個人專屬,不公開(含部署 ID、除錯用)
+CLAUDE.md
+debug_start.sh

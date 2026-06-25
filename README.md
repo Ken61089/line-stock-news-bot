@@ -1,0 +1,229 @@
+# 新聞時程歸檔機器人 — 從零到上線 SOP
+
+在 **LINE** 把財經新聞整段轉貼給機器人 → 用 **Claude** 自動分類、抽出重點 → 寫進你的 **Google Sheet**。
+完全不用開電腦,手機隨手歸檔。
+
+```
+你(LINE)──貼新聞──▶ 機器人(部署在雲端,24h 運作)
+                        │ 1. 看第一行關鍵字分類(個股 / 產業 / 全球局勢 / 知識)
+                        │ 2. Claude 抽出摘要、個股、族群、時程…
+                        │ 3. 寫進對應的 Google Sheet 分頁
+                        ▼
+                   回覆你整理好的重點
+```
+
+---
+
+## 📌 這份文件怎麼用
+
+這份 SOP 同時給「人」和「Claude Code」看。最省力的方式:
+
+1. 把這個 repo 整包下載 / clone 到本機。
+2. 打開 **Claude Code**,在這個資料夾裡說:
+   > 「請依照 README 的 SOP,一步一步帶我建立這個新聞機器人。」
+3. Claude Code 會幫你跑指令、改設定;**需要你親自操作的部分**(開帳號、拿金鑰、刷卡)它會停下來請你做,你照著截圖回報即可。
+
+> 程式碼已經寫好(`news_processor.py`、`bot.py`、`main.py`),你主要是「設定 + 部署」,不太需要自己寫程式。
+
+---
+
+## 你需要準備
+
+| 項目 | 說明 | 費用 |
+|---|---|---|
+| Google 帳號 | 建試算表 + 服務帳戶 | 免費 |
+| LINE 帳號 | 建官方帳號 + Messaging API | 免費 |
+| Zeabur 帳號 | 跑 AI(Claude)+ 租伺服器部署 | 伺服器約 **US$10/月**;AI 預付,每篇新聞約幾毛台幣 |
+| Claude Code | 跟著這份 SOP 操作 | — |
+
+---
+
+## 架構與檔案
+
+| 檔案 | 作用 |
+|---|---|
+| `news_processor.py` | 核心:分類路由 + Claude 結構化抽取 + 寫 Google Sheet |
+| `bot.py` | LINE Webhook 伺服器(Flask),收訊息、回覆 |
+| `main.py` | 進入點(Zeabur 會執行 `python main.py`) |
+| `requirements.txt` | Python 套件 |
+| `Dockerfile` | 容器設定(Zeabur 多半用自家建置器,這個是備用) |
+| `.env.example` | 環境變數範本(複製成 `.env` 填本機測試用) |
+
+---
+
+## 步驟一:Google Sheets + 服務帳戶
+
+讓程式有權限寫你的試算表。
+
+1. 開一張 Google 試算表(例如 [sheets.new](https://sheets.new)),取名(如「股票投資大腦資料庫」)。記下它的 **ID**:網址 `…/spreadsheets/d/【這串就是 ID】/edit`。
+2. 到 [Google Cloud Console](https://console.cloud.google.com/) → 建立新專案。
+3. 「API 與服務 → 程式庫」→ 啟用 **Google Sheets API** 與 **Google Drive API**。
+4. 「API 與服務 → 憑證 → 建立憑證 → 服務帳戶」→ 取名建立(角色可略過)。
+5. 點進該服務帳戶 → 「金鑰」→「新增金鑰 → JSON」→ 下載(這個檔是最高機密,別外流)。
+6. 複製服務帳戶的信箱(`xxx@xxx.iam.gserviceaccount.com`)。
+7. 打開試算表 → 「共用」→ 把這個信箱加為 **編輯者**。
+
+**拿到:** 試算表 ID、服務帳戶 JSON 檔。
+
+---
+
+## 步驟二:LINE 官方帳號 + Messaging API
+
+> ⚠️ LINE 已改流程:不能在開發者後台直接建頻道,要先建「官方帳號」再開啟 Messaging API。
+
+1. 到 [LINE Developers](https://developers.line.biz/) 登入 → 建一個 **Provider**。
+2. 點 **Create a Messaging API channel** → 它會引導你先去 **建立 LINE 官方帳號**(LINE Official Account)。填名稱、Email、業種(隨意)→ 建立。
+3. 進入 **LINE 官方帳號管理後台** → 設定 → **Messaging API** → 啟用 → 連結到剛剛那個 Provider。
+4. 回到 LINE Developers,進入這個頻道:
+   - **Basic settings** → 複製 **Channel secret**
+   - **Messaging API** 分頁 → **Issue** 一組 **Channel access token** → 複製
+5. 用手機 LINE 掃 QR code,把這個機器人**加為好友**。
+6. 在官方帳號管理後台 → **回應設定**:
+   - 回應模式 = **Bot / 聊天機器人**
+   - **Webhook = 啟用**
+   - **自動回應訊息 = 停用**(否則會跟機器人搶著回罐頭訊息)
+
+**拿到:** Channel secret、Channel access token。(Webhook 網址等部署後再填。)
+
+---
+
+## 步驟三:Zeabur AI Hub(Claude 金鑰)
+
+Claude 透過 Zeabur AI Hub 呼叫(OpenAI 相容介面)。
+
+1. 到 Zeabur 後台找到 **AI Hub**。
+2. **先儲值**(例如 US$10)—— 注意:**要先有餘額才能建立金鑰**。
+3. 建立 API 金鑰 → 複製那串 `sk-...`(只顯示一次!馬上存)。
+
+CLI 也可以做:
+```bash
+npx zeabur@latest ai-hub add-balance --amount 10 -i=false
+npx zeabur@latest ai-hub keys create --alias "news-bot" -i=false
+```
+
+**拿到:** AI Hub 金鑰(`sk-...`)。端點:`https://hnd1.aihub.zeabur.ai/v1`(東京),模型用 `claude-sonnet-4-5`。
+
+---
+
+## 步驟四:租伺服器 + 部署到 Zeabur
+
+> Zeabur 現在需要先有一台伺服器才能建專案。
+
+1. Zeabur 後台 → 建立新專案 → 選伺服器。
+   - 最便宜約 **US$3/月**(Tencent / Volcano,**中國業者**)。
+   - 在意資安可選 **Linode 東京 ~US$10/月**(美國 Akamai,離台近)。
+   - 這台之後也能跑你其他小專案。
+2. 在這台伺服器上建立專案(取名,如 `news-tracker`)。
+3. 把本 repo 的程式部署上去(在專案資料夾用 Claude Code 或 CLI):
+   ```bash
+   npx zeabur@latest deploy --project-id <你的PROJECT_ID> --json
+   ```
+   記下回傳的 **service_id**(之後更新會用到)。
+4. 在 Zeabur 後台幫這個服務 **設定環境變數**(見下方總表)。
+   - `GOOGLE_CREDENTIALS_JSON` 請用 **base64**(見踩雷筆記),別直接貼 JSON。
+5. 在服務的 **Networking / Domains** 產生一個公開網址(如 `https://你的名稱.zeabur.app`)。
+
+---
+
+## 步驟五:接上 LINE Webhook + 設白名單
+
+1. 設定 Webhook 網址 = `https://你的網域/callback`
+   - 在 LINE Developers → Messaging API → Webhook settings 填,或用 API:
+   ```bash
+   curl -X PUT https://api.line.me/v2/bot/channel/webhook/endpoint \
+     -H "Authorization: Bearer <你的CHANNEL_ACCESS_TOKEN>" \
+     -H "Content-Type: application/json" \
+     -d '{"endpoint":"https://你的網域/callback"}'
+   ```
+2. 確認 **Use webhook 已開啟**(這個只能在後台點,沒有 API)。
+3. 在 LINE 對機器人傳一個字 **`id`** → 它會回你的 LINE user id。
+4. 把這個 user id 填進環境變數 `LINE_ALLOWED_USER_ID`(只允許你本人使用),然後重啟服務:
+   ```bash
+   npx zeabur@latest service restart --id <service_id> -y -i=false
+   ```
+
+---
+
+## 步驟六:測試
+
+打開 LINE 機器人,**第一行打分類關鍵字,第二行起貼新聞**:
+
+```
+個股新聞
+光聖(6442)受惠CPO需求爆發,光聖三可轉債7/15掛牌…
+```
+
+機器人會回覆整理好的重點,並寫進 Google Sheet 對應分頁 🎉
+
+---
+
+## 環境變數一覽表(填在 Zeabur 後台)
+
+| 變數 | 說明 |
+|---|---|
+| `LINE_CHANNEL_ACCESS_TOKEN` | LINE channel access token |
+| `LINE_CHANNEL_SECRET` | LINE channel secret |
+| `LINE_ALLOWED_USER_ID` | 你的 LINE user id(傳「id」可查;只允許本人) |
+| `OPENAI_API_KEY` | Zeabur AI Hub 金鑰 |
+| `OPENAI_BASE_URL` | `https://hnd1.aihub.zeabur.ai/v1` |
+| `AI_MODEL` | `claude-sonnet-4-5` |
+| `GOOGLE_SHEET_ID` | 試算表 ID |
+| `GOOGLE_SHEET_TAB` | (選填)個股新聞的分頁名,預設「新聞時程動態庫」 |
+| `GOOGLE_CREDENTIALS_JSON` | 服務帳戶 JSON 的 **base64**(見踩雷筆記) |
+
+---
+
+## 使用方式:分類關鍵字
+
+訊息**第一行**打關鍵字,第二行起貼內容:
+
+| 關鍵字 | 分到分頁 | 整理出 |
+|---|---|---|
+| `個股新聞` | 新聞時程動態庫 | 摘要、市場(台/美/日股)、個股、概念族群、關鍵時程 |
+| `產業新聞` | 產業動態 | 摘要、相關產業/族群、重點趨勢、提及個股 |
+| `全球局勢` | 全球局勢動態 | 摘要、影響主題(升息/油價/關稅…)、受影響市場、時程 |
+| `知識` 或 `筆記` | 知識補充庫 | 主題、重點整理、關鍵字 |
+
+沒打關鍵字 → 機器人會提醒你標分類。分頁不存在會自動建立。
+
+---
+
+## ⚠️ 踩雷筆記(別人會少踩很多坑)
+
+1. **Zeabur 會忽略 Dockerfile**:它偵測到 Python 專案就用自家建置器(zbpack),預設執行 `python main.py`。所以**進入點檔名必須是 `main.py`**,改 Dockerfile CMD 沒用。
+2. **Google 憑證要用 base64**:`GOOGLE_CREDENTIALS_JSON` 直接放整包 JSON,會被環境變數管線弄壞引號/換行。改放 **base64**(程式會自動偵測解碼):
+   ```bash
+   base64 -i credentials.json   # 把輸出整段貼進環境變數
+   ```
+3. **AI Hub 不支援 `response_format: json_object`**(會回空 `{}`)。本專案改用「提示詞要求 JSON + 容錯解析」,已內建,不用管。
+4. **容器時區是 UTC**:處理時間會慢 8 小時。本專案已固定用 **UTC+8(台灣時間)**。
+5. **AI 不知道今年幾年**:新聞若只寫月/日,AI 會猜錯年份。本專案已在提示詞帶入「今天日期」,讓它正確推斷。
+6. **看錯誤用「網頁後台 → 運作紀錄」**:Zeabur CLI 的 runtime log 常只給系統事件,看不到 Python 錯誤;網頁後台的運作紀錄才看得到 traceback。
+7. **服務閒置會被停**:沒流量時 Zeabur 可能把服務停掉,有訊息進來會自動起來(第一則可能稍慢)。
+8. **本機測試**:若你的 Mac 是舊版系統 Python(3.9),`pip install` 可能卡在編譯 `cryptography`。建議用較新的 Python(3.11+)或直接部署到 Zeabur 測。
+
+---
+
+## 維運(改東西之後怎麼更新)
+
+```bash
+# 改了程式 → 重新部署(務必帶 --service-id,否則會建出重複服務)
+npx zeabur@latest deploy --project-id <PROJECT_ID> --service-id <SERVICE_ID> --json
+
+# 只改環境變數 → 更新 + 重啟
+npx zeabur@latest variable update --id <SERVICE_ID> -k "KEY=VALUE" -y -i=false
+npx zeabur@latest service restart --id <SERVICE_ID> -y -i=false
+```
+
+---
+
+## 想做更多?
+
+- 「只丟連結就自動抓全文」分析(需接抓網頁服務)
+- 加「概念股主表」自動比對標籤
+- 把其他專案也部署到同一台伺服器
+- 換成 Anthropic 官方 API(只要改 `OPENAI_BASE_URL` 和金鑰)
+
+---
+
+*本 SOP 由實作過程整理而成。歡迎 fork、改造、分享。*
