@@ -5,3 +5,5 @@ openai>=1.54
 gspread>=6.1
 google-auth>=2.35
 pydantic>=2.9
+httpx>=0.27
+trafilatura>=1.12

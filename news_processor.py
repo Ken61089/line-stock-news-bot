@@ -19,6 +19,8 @@ from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError, model_validator
 
+from web_fetch import fetch_article, FetchError
+
 # ==========================================================
 # 設定
 # ==========================================================
@@ -28,6 +30,11 @@ AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-5")
 
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_SHEET_TITLE = os.environ.get("GOOGLE_SHEET_TITLE", "股票投資大腦資料庫")
+
+# 送進 AI 分析的內文字數上限(抓到的全文可能很長)
+MAX_CONTENT_CHARS = int(os.environ.get("MAX_CONTENT_CHARS", "8000"))
+
+_URL_RE = re.compile(r"https?://\S+")
 
 # 台灣時區(UTC+8,固定值;台灣不實施日光節約,雲端伺服器多為 UTC 故需明確指定)
 TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
@@ -237,11 +244,16 @@ _KEYWORDS = [
 _KEYWORDS.sort(key=lambda kv: len(kv[0]), reverse=True)
 
 GUIDANCE = (
-    "⚠️ 請在第一行標上分類關鍵字,第二行起貼內容。\n\n"
+    "⚠️ 請在第一行標上分類關鍵字,第二行起貼內容(或直接貼一個新聞連結)。\n\n"
     "可用分類:\n"
     "• 個股新聞\n• 產業新聞\n• 全球局勢\n• 知識(或筆記)\n\n"
-    "範例:\n個股新聞\n光聖(6442)受惠CPO需求爆發…"
+    "範例:\n個股新聞\n光聖(6442)受惠CPO需求爆發…\n\n"
+    "📎 也可以只貼連結,我會自動抓全文整理。\n"
+    "🔍 想查資料庫?用「查」開頭,例如:查 光聖最近的時程"
 )
+
+# 查詢模式的觸發前綴(訊息開頭出現就進查詢,而非寫入)
+_QUERY_PREFIXES = ["查詢", "查", "問", "搜尋"]
 
 
 class NoCategoryError(Exception):
@@ -326,7 +338,7 @@ def _safe_json_loads(text: str) -> dict:
 # ==========================================================
 # Google Sheets
 # ==========================================================
-def _get_worksheet(tab_name: str, header: List[str]):
+def _open_workbook():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -341,7 +353,11 @@ def _get_worksheet(tab_name: str, header: List[str]):
         creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
 
     gc = gspread.authorize(creds)
-    workbook = gc.open_by_key(GOOGLE_SHEET_ID) if GOOGLE_SHEET_ID else gc.open(GOOGLE_SHEET_TITLE)
+    return gc.open_by_key(GOOGLE_SHEET_ID) if GOOGLE_SHEET_ID else gc.open(GOOGLE_SHEET_TITLE)
+
+
+def _get_worksheet(tab_name: str, header: List[str]):
+    workbook = _open_workbook()
 
     try:
         worksheet = workbook.worksheet(tab_name)
@@ -360,13 +376,43 @@ def _get_worksheet(tab_name: str, header: List[str]):
 # 對外的一站式函數:給 Telegram/LINE 機器人呼叫
 # ==========================================================
 def route_and_store(text: str) -> Result:
+    # 先看是不是「查詢」(用「查」「問」等開頭),是的話走查詢、不寫入
+    question = _detect_query(text)
+    if question is not None:
+        if not question:
+            raise NoCategoryError(
+                "🔍 查詢用法:在「查」後面接你的問題。\n例如:\n查 光聖最近有什麼時程\n查 這週的全球局勢重點"
+            )
+        return _answer_query(question)
+
     cfg, content = detect_category(text)
     if cfg is None:
         raise NoCategoryError(GUIDANCE)
-    if len(content.strip()) < 12:
-        raise NoCategoryError(f"已辨識分類『{cfg.label}』,但下面沒看到內容。請在關鍵字的下一行貼上要記錄的內容。")
 
-    title, url = _extract_title_and_url(content)
+    # 若內容含連結 → 自動抓全文(你只丟連結就好)
+    url = _first_url(content)
+    fetched_title = ""
+    if url:
+        try:
+            fetched_title, article = fetch_article(url)
+            user_note = _URL_RE.sub("", content).strip(" \n:：、,，。-")
+            content = article
+            if len(user_note) >= 4:
+                content = f"{article}\n\n【讀者備註】{user_note}"
+        except FetchError as e:
+            logger.warning("抓取全文失敗,退回使用者貼的文字:%s", e)
+            # 若使用者只丟了連結、沒有可分析的內文 → 明確提示
+            if len(_URL_RE.sub("", content).strip()) < 12:
+                raise NoCategoryError(
+                    "⚠️ 這個連結抓不到內文(可能需要登入或被網站擋爬蟲)。\n"
+                    "請直接複製新聞內文貼上,我就能幫你整理。"
+                ) from e
+
+    if len(content.strip()) < 12:
+        raise NoCategoryError(f"已辨識分類『{cfg.label}』,但下面沒看到內容。請在關鍵字的下一行貼上要記錄的內容,或貼一個新聞連結。")
+
+    content = content[:MAX_CONTENT_CHARS]
+    title = fetched_title or _extract_title(content)
     analysis = _analyze(cfg, title, content)
     now = _now_str()
     worksheet = _get_worksheet(cfg.tab, cfg.header)
@@ -374,18 +420,85 @@ def route_and_store(text: str) -> Result:
     return Result(label=cfg.label, reply=cfg.format_reply(analysis))
 
 
-def _extract_title_and_url(text: str):
-    url_match = re.search(r"https?://\S+", text)
-    url = url_match.group(0) if url_match else ""
-    title = ""
+def _first_url(text: str) -> str:
+    m = _URL_RE.search(text)
+    return m.group(0) if m else ""
+
+
+def _extract_title(text: str) -> str:
     for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("http"):
-            title = line[:120]
-            break
-    if not title:
-        title = (text.strip()[:120] or "(未命名)")
-    return title, url
+            return line[:120]
+    return text.strip()[:120] or "(未命名)"
+
+
+# ==========================================================
+# 反向查詢:讀 Sheet 各分頁,交給 Claude 依資料回答
+# ==========================================================
+ALL_CONFIGS = [INDIVIDUAL, INDUSTRY, GLOBAL, KNOWLEDGE]
+
+# 查詢時每個分頁最多取的近期列數,與送進 AI 的總字元預算
+QUERY_ROWS_PER_TAB = int(os.environ.get("QUERY_ROWS_PER_TAB", "80"))
+QUERY_CHAR_BUDGET = int(os.environ.get("QUERY_CHAR_BUDGET", "15000"))
+
+
+def _detect_query(text: str):
+    """開頭是查詢前綴 → 回傳問題字串(可能為空);否則回傳 None。"""
+    s = text.strip()
+    first_line = s.splitlines()[0].strip() if s else ""
+    for p in _QUERY_PREFIXES:
+        if first_line.startswith(p):
+            return s[len(p):].strip(" :：、,，.。?？\n")
+    return None
+
+
+def _gather_corpus() -> str:
+    """把各分頁的近期資料攤平成精簡文字(較新的在前),供 AI 檢索。"""
+    workbook = _open_workbook()
+    blocks: List[str] = []
+    for cfg in ALL_CONFIGS:
+        try:
+            ws = workbook.worksheet(cfg.tab)
+        except gspread.WorksheetNotFound:
+            continue
+        rows = ws.get_all_values()
+        if len(rows) <= 1:
+            continue
+        header, data = rows[0], rows[1:]
+        for r in reversed(data[-QUERY_ROWS_PER_TAB:]):  # 新的在前
+            cells = [f"{h}:{v}" for h, v in zip(header, r) if v.strip()]
+            if cells:
+                blocks.append(f"〔{cfg.label}〕" + " | ".join(cells))
+    return "\n".join(blocks)[:QUERY_CHAR_BUDGET]
+
+
+def _answer_query(question: str) -> Result:
+    corpus = _gather_corpus()
+    if not corpus.strip():
+        return Result(label="查詢", reply="📭 資料庫目前還沒有任何記錄可以查詢。先貼幾則新聞給我吧!")
+
+    today = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    system_prompt = (
+        "你是使用者私人的財經筆記助理。只根據下方提供的『資料庫內容』回答問題,"
+        "絕對不要編造資料庫裡沒有的事實。若找不到相關記錄,就明白說目前沒有相關記錄。"
+        "用繁體中文、精簡條列回答,適時標出日期與新聞標題,讓使用者能回去查原文。"
+    )
+    user_prompt = (
+        f"今天是 {today}(台灣時間)。\n\n"
+        f"以下是使用者 Google Sheet 投資筆記資料庫(較新的在前):\n\n{corpus}\n\n"
+        f"---\n使用者的問題:{question}\n\n請只根據上面的資料庫內容回答。"
+    )
+    completion = _get_ai_client().chat.completions.create(
+        model=AI_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        max_tokens=1200,
+    )
+    answer = (completion.choices[0].message.content or "").strip() or "(沒有得到回應,請再試一次)"
+    return Result(label="查詢", reply=f"🔍 {question}\n\n{answer}"[:4500])
 
 
 # ==========================================================

@@ -172,6 +172,9 @@ npx zeabur@latest ai-hub keys create --alias "news-bot" -i=false
 | `GOOGLE_SHEET_ID` | 試算表 ID |
 | `GOOGLE_SHEET_TAB` | (選填)個股新聞的分頁名,預設「新聞時程動態庫」 |
 | `GOOGLE_CREDENTIALS_JSON` | 服務帳戶 JSON 的 **base64**(見踩雷筆記) |
+| `FIRECRAWL_API_KEY` | (選填)抓連結全文用;不填則用免費的 trafilatura |
+| `MAX_CONTENT_CHARS` | (選填)送進 AI 分析的內文字數上限,預設 8000 |
+| `QUERY_ROWS_PER_TAB` | (選填)查詢時每個分頁取最近幾列,預設 80 |
 
 ---
 
@@ -187,6 +190,30 @@ npx zeabur@latest ai-hub keys create --alias "news-bot" -i=false
 | `知識` 或 `筆記` | 知識補充庫 | 主題、重點整理、關鍵字 |
 
 沒打關鍵字 → 機器人會提醒你標分類。分頁不存在會自動建立。
+
+### 📎 只丟連結就自動抓全文
+
+懶得複製整段內文時,**第一行打分類、第二行貼新聞連結**即可,機器人會自動抓該頁文章全文再分析:
+
+```
+個股新聞
+https://news.cnyes.com/news/id/xxxxxxx
+```
+
+- 預設用 **trafilatura** 抽正文(免費、零設定)。
+- 若設了 `FIRECRAWL_API_KEY`,會優先用 **Firecrawl**(更會處理動態/難搞網站)。
+- 抓不到(需登入/擋爬蟲)→ 會提示你改貼內文,不會當掉。
+
+### 🔍 反向查詢資料庫
+
+想回頭問資料庫,訊息用 **「查」或「問」開頭**:
+
+```
+查 光聖最近有什麼時程
+問 這週的全球局勢重點
+```
+
+機器人會讀各分頁的近期資料,交給 Claude 依資料回答(找不到會老實說沒有,不會亂編)。
 
 ---
 
@@ -221,8 +248,11 @@ npx zeabur@latest service restart --id <SERVICE_ID> -y -i=false
 
 ## 想做更多?
 
-- 「只丟連結就自動抓全文」分析(需接抓網頁服務)
+- ✅ ~~「只丟連結就自動抓全文」分析~~ — 已內建(trafilatura,可選 Firecrawl)
+- ✅ ~~反向查詢資料庫~~ — 已內建(訊息用「查」開頭)
 - 加「概念股主表」自動比對標籤
+- 每日/每週盤後摘要主動推播
+- 自動判斷分類(免打第一行關鍵字)
 - 把其他專案也部署到同一台伺服器
 - 改用 **Anthropic 官方 API 直連 Claude**(目前是透過 Zeabur AI Hub 呼叫 Claude;若想直連官方,只要改 `OPENAI_BASE_URL` 與金鑰即可——**用的同樣是 Claude,只是換呼叫管道與結帳對象**)
 
