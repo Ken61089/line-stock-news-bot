@@ -179,6 +179,16 @@ def _fmt_report_summary(a: "IndustryReport") -> str:
     return "\n\n".join(parts).strip()
 
 
+# 概念/族群標籤的共用精準規則(附加在會抽概念的分類提示後,降低亂標、統一名稱)
+_CONCEPT_RULE = (
+    " 【概念/族群標籤務求精準,寧缺勿濫】只標內文有明確依據、且確實是該個股核心投資題材的概念或供應鏈族群;"
+    "不要硬塞僅順帶提到、或過於空泛的大方向(例如單獨的『AI』『科技股』『半導體』『景氣復甦』這類太籠統的詞;"
+    "但具體題材如『AI伺服器』『矽光子』則可以)。"
+    "名稱一律用業界慣用的精簡標準寫法(如 CPO、矽光子、磷化銦、HBM、先進封裝、散熱),"
+    "且同一題材每次都用同一個固定名稱(例:一律寫『CPO』,不要一下寫『CPO』一下寫『共同封裝光學』),以利後續比對。"
+)
+
+
 # ==========================================================
 # 分類設定(關鍵字 → 分頁 / 模型 / 提示 / 欄位 / 回覆)
 # ==========================================================
@@ -202,7 +212,7 @@ INDIVIDUAL = CategoryConfig(
     header=["處理時間", "新聞標題", "AI 核心摘要", "提及個股", "概念族群分類", "關鍵時程與事件", "新聞原文/連結", "市場/地區"],
     model=StockNews,
     schema_hint='{"summary":"60-100字摘要","market":"主要市場,如 台股/美股/日股/港股,多個用、分隔","mentioned_stocks":["6442 光聖"],"concept_groups":["CPO","矽光子"],"timelines":[{"date":"2026-07-15","event":"可轉債掛牌"}]}',
-    task="1.撰寫60-100字投資人摘要。2.判斷主要涉及的股票市場/地區(台股/美股/日股/港股等)。3.精確提取個股與代號。4.辨別相關科技概念股/供應鏈族群。5.抽取所有未來關鍵時程。",
+    task="1.撰寫60-100字投資人摘要。2.判斷主要涉及的股票市場/地區(台股/美股/日股/港股等)。3.精確提取個股與代號。4.辨別相關科技概念股/供應鏈族群(concept_groups)。5.抽取所有未來關鍵時程。" + _CONCEPT_RULE,
     to_row=lambda a, title, url, now: [now, title, a.summary, _join(a.mentioned_stocks), _join(a.concept_groups), _fmt_timeline(a.timelines), url, a.market],
     format_reply=lambda a: (
         "✅ 已寫入【個股新聞】\n\n"
@@ -221,7 +231,7 @@ INDUSTRY = CategoryConfig(
     header=["處理時間", "新聞標題", "AI 核心摘要", "相關產業/族群", "重點趨勢", "提及個股", "新聞原文/連結"],
     model=IndustryNews,
     schema_hint='{"summary":"60-100字摘要","industry_groups":["先進封裝","散熱"],"key_trends":["趨勢一","趨勢二"],"mentioned_stocks":["2330 台積電"]}',
-    task="這是產業新聞。1.撰寫60-100字摘要。2.辨別相關產業/供應鏈族群。3.整理出重點趨勢(條列,每點一句)。4.提取文中提及的個股。",
+    task="這是產業新聞。1.撰寫60-100字摘要。2.辨別相關產業/供應鏈族群(industry_groups)。3.整理出重點趨勢(條列,每點一句)。4.提取文中提及的個股。" + _CONCEPT_RULE,
     to_row=lambda a, title, url, now: [now, title, a.summary, _join(a.industry_groups), _fmt_bullets(a.key_trends), _join(a.mentioned_stocks), url],
     format_reply=lambda a: (
         "✅ 已寫入【產業新聞】\n\n"
@@ -289,7 +299,7 @@ REPORT = CategoryConfig(
         "10.利空訊號(risks):同樣對反向字眼敏感,例如:降價/殺價/報價下滑、砍單/掉單、客戶流失/轉單、"
         "產能利用率下降、資本支出縮減/遞延、需求疲弱、庫存調整去化、毛利率下滑、認證未過/出貨遞延等。"
         "catalysts 與 risks 都用簡短詞組條列,每點抓住關鍵(可帶一點原文數字)。"
-    ),
+    ) + _CONCEPT_RULE,
     to_row=lambda a, title, url, now: [
         now, _join(a.stocks), _join(a.concept_groups), a.report_date, a.broker, a.target_price,
         a.recent_revenue, _fmt_timeline(a.timelines), _fmt_report_summary(a), url,
