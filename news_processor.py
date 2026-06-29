@@ -37,6 +37,37 @@ MAX_CONTENT_CHARS = int(os.environ.get("MAX_CONTENT_CHARS", "8000"))
 # 概念股主表分頁(個股 ↔ 概念族群,自動累積)
 CONCEPT_MASTER_TAB = os.environ.get("CONCEPT_MASTER_TAB", "概念股主表")
 
+# 概念題材標準清單分頁(白名單;AI 抽概念時優先對照,名稱統一)
+CONCEPT_LIST_TAB = os.environ.get("CONCEPT_LIST_TAB", "概念清單")
+
+# 種子清單:第一次會寫進「概念清單」分頁,之後你可在 Sheet 自行增刪(改完需重啟服務生效)
+_CONCEPT_SEED = [
+    # AI / 伺服器 / 算力
+    "AI伺服器", "AI ASIC", "CoWoS", "先進封裝", "HBM", "ABF載板", "液冷散熱",
+    "伺服器電源", "BBU備援電池", "高速傳輸", "高速連接器", "銅纜(DAC)",
+    # 半導體
+    "晶圓代工", "先進製程", "成熟製程", "IC設計", "記憶體", "DRAM", "NAND",
+    "封測", "矽智財(IP)", "半導體設備", "矽晶圓", "第三類半導體", "SiC", "GaN",
+    # 光通訊 / 化合物
+    "CPO", "矽光子", "光通訊", "光收發模組", "磷化銦(InP)", "砷化鎵(GaAs)", "CW Laser",
+    # 消費電子 / 蘋果鏈
+    "蘋果概念", "手機供應鏈", "折疊機", "PCB", "軟板(FPC)", "被動元件", "連接器", "機殼",
+    # 電動車 / 車用
+    "電動車", "車用電子", "車用半導體", "ADAS自駕", "充電樁", "車用PCB",
+    # 機器人 / 自動化 / 無人機
+    "人形機器人", "工業自動化", "機器視覺", "無人機", "軍工國防",
+    # 網通 / 衛星
+    "低軌衛星", "衛星通訊", "網通設備", "WiFi 7",
+    # 綠能 / 重電 / 電力
+    "重電", "智慧電網", "綠能", "太陽能", "離岸風電", "儲能", "氫能", "電力設備",
+    # 生技醫療
+    "新藥", "CDMO", "醫材", "減肥藥(GLP-1)", "生技",
+    # 傳產 / 其他
+    "散熱", "散裝航運", "貨櫃航運", "鋼鐵", "資產題材", "金融",
+]
+
+_whitelist_cache = None
+
 _URL_RE = re.compile(r"https?://\S+")
 
 # 台灣時區(UTC+8,固定值;台灣不實施日光節約,雲端伺服器多為 UTC 故需明確指定)
@@ -390,6 +421,16 @@ def _analyze(cfg: CategoryConfig, title: str, content: str):
 請「只」回傳符合下列結構的 JSON,沒有資料的欄位給空陣列或空字串;陣列內一律放純文字字串(不要包成物件):
 {cfg.schema_hint}
 """
+    # 會抽概念的分類:附上標準清單(白名單),讓 AI 優先用統一名稱
+    if cfg.to_concept_pairs:
+        whitelist = _get_concept_whitelist()
+        if whitelist:
+            user_prompt += (
+                "\n\n【概念/族群標準清單】抽取概念或族群標籤時,若意思與下列清單中的項目相同,"
+                "請『直接沿用清單裡的標準寫法』;只有清單真的找不到對應時,才自行命名(用業界慣用簡稱)。\n"
+                + "、".join(whitelist)
+            )
+
     last_err = None
     for _ in range(2):
         try:
@@ -530,6 +571,30 @@ def _update_concept_master(pairs, now: str) -> str:
         ws.append_rows(appends, value_input_option="USER_ENTERED")
 
     return "🏷️ 概念股主表已更新:\n" + "\n".join(lines)
+
+
+def _get_concept_whitelist() -> List[str]:
+    """讀「概念清單」分頁當白名單;不存在則用種子建立。結果快取(改清單需重啟生效)。"""
+    global _whitelist_cache
+    if _whitelist_cache is not None:
+        return _whitelist_cache
+    try:
+        wb = _open_workbook()
+        try:
+            ws = wb.worksheet(CONCEPT_LIST_TAB)
+            items = [v.strip() for v in ws.col_values(1)[1:] if v.strip()]  # 跳過標題列
+            if not items:  # 分頁存在但沒內容 → 補種子
+                items = list(_CONCEPT_SEED)
+                ws.update(values=[[x] for x in items], range_name="A2")
+        except gspread.WorksheetNotFound:
+            ws = wb.add_worksheet(title=CONCEPT_LIST_TAB, rows=max(len(_CONCEPT_SEED) + 20, 120), cols=2)
+            ws.update(values=[["概念/題材標準名稱"]] + [[x] for x in _CONCEPT_SEED], range_name="A1")
+            items = list(_CONCEPT_SEED)
+        _whitelist_cache = items
+    except Exception as e:  # noqa: BLE001
+        logger.warning("讀取概念清單失敗,改用內建種子清單:%s", e)
+        _whitelist_cache = list(_CONCEPT_SEED)
+    return _whitelist_cache
 
 
 # ==========================================================
