@@ -501,11 +501,11 @@ def _get_worksheet(tab_name: str, header: List[str]):
 
 
 # ==========================================================
-# 概念股主表(個股 ↔ 概念族群,自動累積)
+# 概念股主表(概念導向:一列一個概念,右邊列出成分股,自動累積)
 # ==========================================================
-_CONCEPT_MASTER_HEADER = ["個股", "概念/族群標籤", "出現次數", "首次出現", "最近出現"]
+_CONCEPT_MASTER_HEADER = ["概念/題材", "成分股", "個股數", "首次出現", "最近出現"]
 _STOCK_CODE_RE = re.compile(r"\d{3,6}")
-_TAG_SPLIT_RE = re.compile(r"[,、,;；/]")
+_LIST_SPLIT_RE = re.compile(r"[,、,;；/]")
 
 
 def _stock_key(s: str) -> str:
@@ -514,56 +514,52 @@ def _stock_key(s: str) -> str:
     return m.group(0) if m else re.sub(r"\s+", "", s).lower()
 
 
-def _split_tags(s: str) -> List[str]:
-    return [t.strip() for t in _TAG_SPLIT_RE.split(s) if t.strip()]
+def _split_list(s: str) -> List[str]:
+    return [t.strip() for t in _LIST_SPLIT_RE.split(s) if t.strip()]
 
 
 def _update_concept_master(pairs, now: str) -> str:
-    """把 [(個股, [概念...]), ...] upsert 進概念股主表;回傳給使用者看的更新摘要。"""
-    # 先合併本批同一檔的概念(去重、保序)
+    """把 [(個股, [概念...]), ...] 反轉成「概念 → 成分股」upsert 進主表;回傳更新摘要。"""
+    # 反轉:concept -> [個股顯示名](以代號去重、保序)
     batch, order = {}, []
     for stock, concepts in pairs or []:
         stock = (stock or "").strip()
         if not stock:
             continue
-        key = _stock_key(stock)
-        if key not in batch:
-            batch[key] = {"display": stock, "concepts": []}
-            order.append(key)
-        # 顯示名優先採用「含代號」的版本
-        if _STOCK_CODE_RE.search(stock) and not _STOCK_CODE_RE.search(batch[key]["display"]):
-            batch[key]["display"] = stock
         for c in concepts or []:
             c = (c or "").strip()
-            if c and c not in batch[key]["concepts"]:
-                batch[key]["concepts"].append(c)
+            if not c:
+                continue
+            if c not in batch:
+                batch[c] = []
+                order.append(c)
+            if not any(_stock_key(stock) == _stock_key(x) for x in batch[c]):
+                batch[c].append(stock)
     if not batch:
         return ""
 
     ws = _get_worksheet(CONCEPT_MASTER_TAB, _CONCEPT_MASTER_HEADER)
     rows = ws.get_all_values()
-    existing = {}  # key -> (列號1-based, 該列資料)
+    existing = {}  # 概念 -> (列號1-based, 該列資料)
     for i, r in enumerate(rows[1:], start=2):
         if r and r[0].strip():
-            existing[_stock_key(r[0])] = (i, r)
+            existing[r[0].strip()] = (i, r)
 
     updates, appends, lines = [], [], []
-    for key in order:
-        b = batch[key]
-        if key in existing:
-            ridx, r = existing[key]
-            merged = _split_tags(r[1]) if len(r) > 1 else []
-            new_added = [c for c in b["concepts"] if c not in merged]
-            merged += new_added
-            cnt = (int(r[2]) + 1) if (len(r) > 2 and r[2].strip().isdigit()) else 1
+    for c in order:
+        new_stocks = batch[c]
+        if c in existing:
+            ridx, r = existing[c]
+            cur = _split_list(r[1]) if len(r) > 1 else []
+            added = [s for s in new_stocks if not any(_stock_key(s) == _stock_key(x) for x in cur)]
+            merged = cur + added
             first = r[3] if (len(r) > 3 and r[3].strip()) else now
-            display = b["display"] if (_STOCK_CODE_RE.search(b["display"]) and not _STOCK_CODE_RE.search(r[0])) else r[0]
-            updates.append((f"A{ridx}:E{ridx}", [[display, ", ".join(merged), cnt, first, now]]))
-            note = f"(本次新增:{', '.join(new_added)})" if new_added else ""
-            lines.append(f"• {display} → {', '.join(merged) or '(無標籤)'} {note}".rstrip())
+            updates.append((f"A{ridx}:E{ridx}", [[c, ", ".join(merged), len(merged), first, now]]))
+            note = f"(新增:{', '.join(added)})" if added else "(無新增)"
+            lines.append(f"• {c}({len(merged)}檔):{', '.join(merged)} {note}")
         else:
-            appends.append([b["display"], ", ".join(b["concepts"]), 1, now, now])
-            lines.append(f"• {b['display']} → {', '.join(b['concepts']) or '(無標籤)'} (新檔)")
+            appends.append([c, ", ".join(new_stocks), len(new_stocks), now, now])
+            lines.append(f"• {c}({len(new_stocks)}檔):{', '.join(new_stocks)} (新概念)")
 
     for rng, vals in updates:
         ws.update(values=vals, range_name=rng, value_input_option="USER_ENTERED")
