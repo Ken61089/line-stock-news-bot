@@ -34,6 +34,9 @@ GOOGLE_SHEET_TITLE = os.environ.get("GOOGLE_SHEET_TITLE", "股票投資大腦資
 # 送進 AI 分析的內文字數上限(抓到的全文可能很長)
 MAX_CONTENT_CHARS = int(os.environ.get("MAX_CONTENT_CHARS", "8000"))
 
+# 概念股主表分頁(個股 ↔ 概念族群,自動累積)
+CONCEPT_MASTER_TAB = os.environ.get("CONCEPT_MASTER_TAB", "概念股主表")
+
 _URL_RE = re.compile(r"https?://\S+")
 
 # 台灣時區(UTC+8,固定值;台灣不實施日光節約,雲端伺服器多為 UTC 故需明確指定)
@@ -188,6 +191,8 @@ class CategoryConfig:
     task: str
     to_row: Callable
     format_reply: Callable
+    # 回傳 [(個股字串, [概念標籤...]), ...] 供更新「概念股主表」;None = 此分類不參與
+    to_concept_pairs: Callable = None
 
 
 INDIVIDUAL = CategoryConfig(
@@ -206,6 +211,7 @@ INDIVIDUAL = CategoryConfig(
         f"🏷️ 族群:{_join(a.concept_groups) or '(無)'}\n"
         f"🗓️ 時程:\n{_fmt_timeline(a.timelines) or '  (無明確時程)'}"
     ),
+    to_concept_pairs=lambda a: [(s, a.concept_groups) for s in a.mentioned_stocks],
 )
 
 INDUSTRY = CategoryConfig(
@@ -223,6 +229,7 @@ INDUSTRY = CategoryConfig(
         f"📊 重點趨勢:\n{_fmt_bullets(a.key_trends) or '  (無)'}\n"
         f"📈 個股:{_join(a.mentioned_stocks) or '(無)'}"
     ),
+    to_concept_pairs=lambda a: [(s, a.industry_groups) for s in a.mentioned_stocks],
 )
 
 GLOBAL = CategoryConfig(
@@ -296,6 +303,7 @@ REPORT = CategoryConfig(
         f"🔴 利空:{_join(a.risks) or '(無)'}\n"
         f"🗓️ 時間軸:\n{_fmt_timeline(a.timelines) or '  (無明確時程)'}"
     ),
+    to_concept_pairs=lambda a: [(s, []) for s in a.stocks],
 )
 
 # 關鍵字 → 分類(含別名);依長度由長到短比對,避免「個股」先吃掉「個股新聞」
@@ -438,6 +446,79 @@ def _get_worksheet(tab_name: str, header: List[str]):
 
 
 # ==========================================================
+# 概念股主表(個股 ↔ 概念族群,自動累積)
+# ==========================================================
+_CONCEPT_MASTER_HEADER = ["個股", "概念/族群標籤", "出現次數", "首次出現", "最近出現"]
+_STOCK_CODE_RE = re.compile(r"\d{3,6}")
+_TAG_SPLIT_RE = re.compile(r"[,、,;；/]")
+
+
+def _stock_key(s: str) -> str:
+    """個股的去重鍵:優先用代號(台股 3-6 位數),否則用去空白小寫的名稱。"""
+    m = _STOCK_CODE_RE.search(s)
+    return m.group(0) if m else re.sub(r"\s+", "", s).lower()
+
+
+def _split_tags(s: str) -> List[str]:
+    return [t.strip() for t in _TAG_SPLIT_RE.split(s) if t.strip()]
+
+
+def _update_concept_master(pairs, now: str) -> str:
+    """把 [(個股, [概念...]), ...] upsert 進概念股主表;回傳給使用者看的更新摘要。"""
+    # 先合併本批同一檔的概念(去重、保序)
+    batch, order = {}, []
+    for stock, concepts in pairs or []:
+        stock = (stock or "").strip()
+        if not stock:
+            continue
+        key = _stock_key(stock)
+        if key not in batch:
+            batch[key] = {"display": stock, "concepts": []}
+            order.append(key)
+        # 顯示名優先採用「含代號」的版本
+        if _STOCK_CODE_RE.search(stock) and not _STOCK_CODE_RE.search(batch[key]["display"]):
+            batch[key]["display"] = stock
+        for c in concepts or []:
+            c = (c or "").strip()
+            if c and c not in batch[key]["concepts"]:
+                batch[key]["concepts"].append(c)
+    if not batch:
+        return ""
+
+    ws = _get_worksheet(CONCEPT_MASTER_TAB, _CONCEPT_MASTER_HEADER)
+    rows = ws.get_all_values()
+    existing = {}  # key -> (列號1-based, 該列資料)
+    for i, r in enumerate(rows[1:], start=2):
+        if r and r[0].strip():
+            existing[_stock_key(r[0])] = (i, r)
+
+    updates, appends, lines = [], [], []
+    for key in order:
+        b = batch[key]
+        if key in existing:
+            ridx, r = existing[key]
+            merged = _split_tags(r[1]) if len(r) > 1 else []
+            new_added = [c for c in b["concepts"] if c not in merged]
+            merged += new_added
+            cnt = (int(r[2]) + 1) if (len(r) > 2 and r[2].strip().isdigit()) else 1
+            first = r[3] if (len(r) > 3 and r[3].strip()) else now
+            display = b["display"] if (_STOCK_CODE_RE.search(b["display"]) and not _STOCK_CODE_RE.search(r[0])) else r[0]
+            updates.append((f"A{ridx}:E{ridx}", [[display, ", ".join(merged), cnt, first, now]]))
+            note = f"(本次新增:{', '.join(new_added)})" if new_added else ""
+            lines.append(f"• {display} → {', '.join(merged) or '(無標籤)'} {note}".rstrip())
+        else:
+            appends.append([b["display"], ", ".join(b["concepts"]), 1, now, now])
+            lines.append(f"• {b['display']} → {', '.join(b['concepts']) or '(無標籤)'} (新檔)")
+
+    for rng, vals in updates:
+        ws.update(values=vals, range_name=rng, value_input_option="USER_ENTERED")
+    if appends:
+        ws.append_rows(appends, value_input_option="USER_ENTERED")
+
+    return "🏷️ 概念股主表已更新:\n" + "\n".join(lines)
+
+
+# ==========================================================
 # 對外的一站式函數:給 Telegram/LINE 機器人呼叫
 # ==========================================================
 def route_and_store(text: str) -> Result:
@@ -482,7 +563,18 @@ def route_and_store(text: str) -> Result:
     now = _now_str()
     worksheet = _get_worksheet(cfg.tab, cfg.header)
     worksheet.append_row(cfg.to_row(analysis, title, url, now), value_input_option="USER_ENTERED")
-    return Result(label=cfg.label, reply=cfg.format_reply(analysis))
+
+    reply = cfg.format_reply(analysis)
+    # 自動更新「概念股主表」(個股↔概念),失敗不影響存檔
+    if cfg.to_concept_pairs:
+        try:
+            addendum = _update_concept_master(cfg.to_concept_pairs(analysis), now)
+            if addendum:
+                reply = f"{reply}\n\n{addendum}"
+        except Exception as e:  # noqa: BLE001
+            logger.warning("更新概念股主表失敗(不影響存檔):%s", e)
+
+    return Result(label=cfg.label, reply=reply)
 
 
 def _first_url(text: str) -> str:
@@ -535,6 +627,20 @@ def _gather_corpus() -> str:
             cells = [f"{h}:{v}" for h, v in zip(header, r) if v.strip()]
             if cells:
                 blocks.append(f"〔{cfg.label}〕" + " | ".join(cells))
+
+    # 附上概念股主表(個股↔概念對照),方便回答「某檔有哪些概念/某概念有哪些股」
+    try:
+        ws = workbook.worksheet(CONCEPT_MASTER_TAB)
+        rows = ws.get_all_values()
+        if len(rows) > 1:
+            header = rows[0]
+            for r in rows[1:]:
+                if r and r[0].strip():
+                    cells = [f"{h}:{v}" for h, v in zip(header, r) if v.strip()]
+                    blocks.append("〔概念股主表〕" + " | ".join(cells))
+    except gspread.WorksheetNotFound:
+        pass
+
     return "\n".join(blocks)[:QUERY_CHAR_BUDGET]
 
 
