@@ -141,6 +141,7 @@ class KnowledgeNote(_CoercedModel):
 
 class IndustryReport(_CoercedModel):
     stocks: List[str] = []          # 報告涵蓋的個股
+    concept_groups: List[str] = []  # 概念股/題材族群(如 CPO、磷化銦、光通訊)
     report_date: str = ""           # 報告日期
     broker: str = ""                # 出具報告的券商/機構
     target_price: str = ""          # 券商目標價
@@ -268,32 +269,35 @@ KNOWLEDGE = CategoryConfig(
 REPORT = CategoryConfig(
     label="產業報告",
     tab="個股產業報告",
-    header=["處理時間", "個股", "報告日期", "出具券商", "券商目標價", "近期營收", "時間軸", "報告總結", "報告原文/連結"],
+    header=["處理時間", "個股", "概念股", "報告日期", "出具券商", "券商目標價", "近期營收", "時間軸", "報告總結", "報告原文/連結"],
     model=IndustryReport,
-    schema_hint='{"stocks":["2330 台積電"],"report_date":"2026-06-27","broker":"摩根士丹利","target_price":"1200元","recent_revenue":"5月營收月增12%、年增20%","timelines":[{"date":"2026-07-16","event":"法說會"}],"summary":"80-150字報告總結","catalysts":["先進製程調漲","切入NVIDIA供應鏈","CoWoS擴產"],"risks":["匯率逆風","記憶體報價回落"]}',
+    schema_hint='{"stocks":["2455 全新"],"concept_groups":["磷化銦","光通訊","CPO","矽光子"],"report_date":"2026-06-27","broker":"摩根士丹利","target_price":"473元","recent_revenue":"5月營收月增0.69%、年增46.51%","timelines":[{"date":"2026-07-16","event":"法說會"}],"summary":"80-150字報告總結","catalysts":["產品調漲雙位數","切入美系客戶供應鏈","擴產"],"risks":["PA出貨不如預期","資料中心需求趨緩"]}',
     task=(
         "這是券商/分析師出具的個股研究報告(或法人報告、產業深度報告)。請結構化整理:"
         "1.報告涵蓋的個股與代號(stocks)。"
-        "2.報告日期(report_date,YYYY-MM-DD;若只寫月/日,用今天日期推斷正確年份)。"
-        "3.出具報告的券商/機構(broker)。"
-        "4.券商給的目標價(target_price,含單位,如「1200元」;沒有就留空)。"
-        "5.近期營收狀況(recent_revenue,如月營收年增率、季營收、毛利率等具體數字)。"
-        "6.關鍵時程(timelines,如法說會、新廠投產、新品量產、訂單交付)。"
-        "7.報告總結(summary,80-150字,寫給投資人看的重點)。"
-        "8.【特別重要】利多訊號(catalysts):請對任何看起來會『帶動營收成長或公司轉型』的字眼高度敏感、寧多勿漏,"
+        "2.這檔屬於哪些概念股/題材族群(concept_groups),即報告主角所屬的投資題材,"
+        "例如 CPO、矽光子、磷化銦、光通訊、先進封裝、散熱、AI伺服器、機器人等(可多個,沒有就留空)。"
+        "3.報告日期(report_date,YYYY-MM-DD;若只寫月/日,用今天日期推斷正確年份)。"
+        "4.出具報告的券商/機構(broker)。"
+        "5.券商給的目標價(target_price,含單位,如「1200元」;沒有就留空)。"
+        "6.近期營收狀況(recent_revenue,如月營收年增率、季營收、毛利率等具體數字)。"
+        "7.關鍵時程(timelines,如法說會、新廠投產、新品量產、訂單交付)。"
+        "8.報告總結(summary,80-150字,寫給投資人看的重點)。"
+        "9.【特別重要】利多訊號(catalysts):請對任何看起來會『帶動營收成長或公司轉型』的字眼高度敏感、寧多勿漏,"
         "例如:漲價/調漲/報價上揚、新增客戶/拿下大單、打入或切入某供應鏈/通過認證、擴產/擴廠/擴充產能、"
         "資本支出增加/上修、轉型、產能滿載/利用率提升、訂單能見度高、急單、供不應求、毛利率提升、新產品/新應用等。"
-        "9.利空訊號(risks):同樣對反向字眼敏感,例如:降價/殺價/報價下滑、砍單/掉單、客戶流失/轉單、"
+        "10.利空訊號(risks):同樣對反向字眼敏感,例如:降價/殺價/報價下滑、砍單/掉單、客戶流失/轉單、"
         "產能利用率下降、資本支出縮減/遞延、需求疲弱、庫存調整去化、毛利率下滑、認證未過/出貨遞延等。"
         "catalysts 與 risks 都用簡短詞組條列,每點抓住關鍵(可帶一點原文數字)。"
     ),
     to_row=lambda a, title, url, now: [
-        now, _join(a.stocks), a.report_date, a.broker, a.target_price,
+        now, _join(a.stocks), _join(a.concept_groups), a.report_date, a.broker, a.target_price,
         a.recent_revenue, _fmt_timeline(a.timelines), _fmt_report_summary(a), url,
     ],
     format_reply=lambda a: (
         "✅ 已寫入【產業報告】\n\n"
         f"📈 個股:{_join(a.stocks) or '(未標明)'}\n"
+        f"🏷️ 概念股:{_join(a.concept_groups) or '(無)'}\n"
         f"🏦 券商:{a.broker or '(未標明)'}\n"
         f"🎯 目標價:{a.target_price or '(無)'}\n"
         f"💰 近期營收:{a.recent_revenue or '(無)'}\n"
@@ -303,7 +307,7 @@ REPORT = CategoryConfig(
         f"🔴 利空:{_join(a.risks) or '(無)'}\n"
         f"🗓️ 時間軸:\n{_fmt_timeline(a.timelines) or '  (無明確時程)'}"
     ),
-    to_concept_pairs=lambda a: [(s, []) for s in a.stocks],
+    to_concept_pairs=lambda a: [(s, a.concept_groups) for s in a.stocks],
 )
 
 # 關鍵字 → 分類(含別名);依長度由長到短比對,避免「個股」先吃掉「個股新聞」
