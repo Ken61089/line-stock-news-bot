@@ -136,6 +136,18 @@ class KnowledgeNote(_CoercedModel):
     keywords: List[str] = []
 
 
+class IndustryReport(_CoercedModel):
+    stocks: List[str] = []          # 報告涵蓋的個股
+    report_date: str = ""           # 報告日期
+    broker: str = ""                # 出具報告的券商/機構
+    target_price: str = ""          # 券商目標價
+    recent_revenue: str = ""        # 近期營收狀況
+    timelines: List[TimelineEvent] = []  # 關鍵時程
+    summary: str = ""               # 報告總結
+    catalysts: List[str] = []       # 利多訊號(帶動營收/轉型的字眼)
+    risks: List[str] = []           # 利空訊號(反向字眼)
+
+
 # ==========================================================
 # 格式化小工具
 # ==========================================================
@@ -149,6 +161,18 @@ def _fmt_bullets(items: List[str]) -> str:
 
 def _join(items: List[str]) -> str:
     return ", ".join(items)
+
+
+def _fmt_report_summary(a: "IndustryReport") -> str:
+    """報告總結欄:總結 + 明確標出利多/利空訊號,方便日後篩選。"""
+    parts = []
+    if a.summary:
+        parts.append(a.summary)
+    if a.catalysts:
+        parts.append("【利多訊號】\n" + _fmt_bullets(a.catalysts))
+    if a.risks:
+        parts.append("【利空訊號】\n" + _fmt_bullets(a.risks))
+    return "\n\n".join(parts).strip()
 
 
 # ==========================================================
@@ -234,9 +258,50 @@ KNOWLEDGE = CategoryConfig(
     ),
 )
 
+REPORT = CategoryConfig(
+    label="產業報告",
+    tab="個股產業報告",
+    header=["處理時間", "個股", "報告日期", "出具券商", "券商目標價", "近期營收", "時間軸", "報告總結", "報告原文/連結"],
+    model=IndustryReport,
+    schema_hint='{"stocks":["2330 台積電"],"report_date":"2026-06-27","broker":"摩根士丹利","target_price":"1200元","recent_revenue":"5月營收月增12%、年增20%","timelines":[{"date":"2026-07-16","event":"法說會"}],"summary":"80-150字報告總結","catalysts":["先進製程調漲","切入NVIDIA供應鏈","CoWoS擴產"],"risks":["匯率逆風","記憶體報價回落"]}',
+    task=(
+        "這是券商/分析師出具的個股研究報告(或法人報告、產業深度報告)。請結構化整理:"
+        "1.報告涵蓋的個股與代號(stocks)。"
+        "2.報告日期(report_date,YYYY-MM-DD;若只寫月/日,用今天日期推斷正確年份)。"
+        "3.出具報告的券商/機構(broker)。"
+        "4.券商給的目標價(target_price,含單位,如「1200元」;沒有就留空)。"
+        "5.近期營收狀況(recent_revenue,如月營收年增率、季營收、毛利率等具體數字)。"
+        "6.關鍵時程(timelines,如法說會、新廠投產、新品量產、訂單交付)。"
+        "7.報告總結(summary,80-150字,寫給投資人看的重點)。"
+        "8.【特別重要】利多訊號(catalysts):請對任何看起來會『帶動營收成長或公司轉型』的字眼高度敏感、寧多勿漏,"
+        "例如:漲價/調漲/報價上揚、新增客戶/拿下大單、打入或切入某供應鏈/通過認證、擴產/擴廠/擴充產能、"
+        "資本支出增加/上修、轉型、產能滿載/利用率提升、訂單能見度高、急單、供不應求、毛利率提升、新產品/新應用等。"
+        "9.利空訊號(risks):同樣對反向字眼敏感,例如:降價/殺價/報價下滑、砍單/掉單、客戶流失/轉單、"
+        "產能利用率下降、資本支出縮減/遞延、需求疲弱、庫存調整去化、毛利率下滑、認證未過/出貨遞延等。"
+        "catalysts 與 risks 都用簡短詞組條列,每點抓住關鍵(可帶一點原文數字)。"
+    ),
+    to_row=lambda a, title, url, now: [
+        now, _join(a.stocks), a.report_date, a.broker, a.target_price,
+        a.recent_revenue, _fmt_timeline(a.timelines), _fmt_report_summary(a), url,
+    ],
+    format_reply=lambda a: (
+        "✅ 已寫入【產業報告】\n\n"
+        f"📈 個股:{_join(a.stocks) or '(未標明)'}\n"
+        f"🏦 券商:{a.broker or '(未標明)'}\n"
+        f"🎯 目標價:{a.target_price or '(無)'}\n"
+        f"💰 近期營收:{a.recent_revenue or '(無)'}\n"
+        f"📅 報告日期:{a.report_date or '(無)'}\n"
+        f"📝 總結:{a.summary or '(無)'}\n"
+        f"🟢 利多:{_join(a.catalysts) or '(無)'}\n"
+        f"🔴 利空:{_join(a.risks) or '(無)'}\n"
+        f"🗓️ 時間軸:\n{_fmt_timeline(a.timelines) or '  (無明確時程)'}"
+    ),
+)
+
 # 關鍵字 → 分類(含別名);依長度由長到短比對,避免「個股」先吃掉「個股新聞」
 _KEYWORDS = [
     ("個股新聞", INDIVIDUAL), ("個股", INDIVIDUAL),
+    ("產業報告", REPORT), ("個股報告", REPORT), ("券商報告", REPORT), ("研究報告", REPORT), ("法人報告", REPORT),
     ("產業新聞", INDUSTRY), ("產業", INDUSTRY),
     ("全球局勢新聞", GLOBAL), ("全球局勢", GLOBAL), ("全球", GLOBAL), ("總經", GLOBAL), ("國際", GLOBAL),
     ("知識補充", KNOWLEDGE), ("知識", KNOWLEDGE), ("筆記", KNOWLEDGE), ("觀念", KNOWLEDGE),
@@ -246,7 +311,7 @@ _KEYWORDS.sort(key=lambda kv: len(kv[0]), reverse=True)
 GUIDANCE = (
     "⚠️ 請在第一行標上分類關鍵字,第二行起貼內容(或直接貼一個新聞連結)。\n\n"
     "可用分類:\n"
-    "• 個股新聞\n• 產業新聞\n• 全球局勢\n• 知識(或筆記)\n\n"
+    "• 個股新聞\n• 產業新聞\n• 產業報告(券商研究報告)\n• 全球局勢\n• 知識(或筆記)\n\n"
     "範例:\n個股新聞\n光聖(6442)受惠CPO需求爆發…\n\n"
     "📎 也可以只貼連結,我會自動抓全文整理。\n"
     "🔍 想查資料庫?用「查」開頭,例如:查 光聖最近的時程"
@@ -436,7 +501,7 @@ def _extract_title(text: str) -> str:
 # ==========================================================
 # 反向查詢:讀 Sheet 各分頁,交給 Claude 依資料回答
 # ==========================================================
-ALL_CONFIGS = [INDIVIDUAL, INDUSTRY, GLOBAL, KNOWLEDGE]
+ALL_CONFIGS = [INDIVIDUAL, INDUSTRY, REPORT, GLOBAL, KNOWLEDGE]
 
 # 查詢時每個分頁最多取的近期列數,與送進 AI 的總字元預算
 QUERY_ROWS_PER_TAB = int(os.environ.get("QUERY_ROWS_PER_TAB", "80"))
