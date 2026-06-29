@@ -251,6 +251,7 @@ https://news.cnyes.com/news/id/xxxxxxx
    ```bash
    npx zeabur@latest service exec --id <SERVICE_ID> --env-id <ENV_ID> -i=false -- sh -c "grep -c 你改的關鍵字 news_processor.py"
    ```
+   ⚠️ **deploy 回報 success 不代表容器已換版**:有時舊容器還在跑,驗證會發現線上仍是舊碼。保險做法是 deploy 後再 `service restart` 一次強制套用最新部署。
 10. **Windows PowerShell 跑 `npx` 被擋**:出現 `因為這個系統上已停用指令碼執行` 時,改用 `npx.cmd zeabur@latest ...`(`.cmd` 不受執行原則限制),或先 `Set-ExecutionPolicy -Scope Process Bypass -Force`。
 
 ---
@@ -261,6 +262,8 @@ https://news.cnyes.com/news/id/xxxxxxx
 # 改了程式 → 先提交,再重新部署(deploy 只會部署「已提交」的版本!)
 git add -A && git commit -m "說明這次改了什麼"
 npx zeabur@latest deploy --project-id <PROJECT_ID> --service-id <SERVICE_ID> -i=false --json
+# deploy 後保險起見重啟一次,強制套用最新部署(否則可能還跑舊容器)
+npx zeabur@latest service restart --id <SERVICE_ID> --env-id <ENV_ID> -y -i=false
 # 想讓 GitHub 也同步
 git push origin main
 
