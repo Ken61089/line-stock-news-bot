@@ -230,19 +230,29 @@ https://news.cnyes.com/news/id/xxxxxxx
 6. **看錯誤用「網頁後台 → 運作紀錄」**:Zeabur CLI 的 runtime log 常只給系統事件,看不到 Python 錯誤;網頁後台的運作紀錄才看得到 traceback。
 7. **服務閒置會被停**:沒流量時 Zeabur 可能把服務停掉,有訊息進來會自動起來(第一則可能稍慢)。
 8. **本機測試**:若你的 Mac 是舊版系統 Python(3.9),`pip install` 可能卡在編譯 `cryptography`。建議用較新的 Python(3.11+)或直接部署到 Zeabur 測。
+9. **`zeabur deploy` 只部署 git 已提交的版本**:改完程式如果沒先 `git commit` 就 deploy,線上會跑到舊碼(新功能不會生效)。**改完一定要先 commit 再 deploy。** 部署後可進容器驗證線上是新版:
+   ```bash
+   npx zeabur@latest service exec --id <SERVICE_ID> --env-id <ENV_ID> -i=false -- sh -c "grep -c 你改的關鍵字 news_processor.py"
+   ```
+10. **Windows PowerShell 跑 `npx` 被擋**:出現 `因為這個系統上已停用指令碼執行` 時,改用 `npx.cmd zeabur@latest ...`(`.cmd` 不受執行原則限制),或先 `Set-ExecutionPolicy -Scope Process Bypass -Force`。
 
 ---
 
 ## 維運(改東西之後怎麼更新)
 
 ```bash
-# 改了程式 → 重新部署(務必帶 --service-id,否則會建出重複服務)
-npx zeabur@latest deploy --project-id <PROJECT_ID> --service-id <SERVICE_ID> --json
+# 改了程式 → 先提交,再重新部署(deploy 只會部署「已提交」的版本!)
+git add -A && git commit -m "說明這次改了什麼"
+npx zeabur@latest deploy --project-id <PROJECT_ID> --service-id <SERVICE_ID> -i=false --json
+# 想讓 GitHub 也同步
+git push origin main
 
 # 只改環境變數 → 更新 + 重啟
 npx zeabur@latest variable update --id <SERVICE_ID> -k "KEY=VALUE" -y -i=false
 npx zeabur@latest service restart --id <SERVICE_ID> -y -i=false
 ```
+
+> Windows 若 `npx` 被 PowerShell 執行原則擋住,把上面的 `npx` 改成 `npx.cmd`。
 
 ---
 
