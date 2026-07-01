@@ -58,7 +58,8 @@ def _post(path: str, payload: dict) -> dict:
 
 
 def find_stock_page(code: str, name: str = "") -> dict | None:
-    """在個股主表用代號(優先)或名稱找個股頁。回傳 {'id', 'label'} 或 None。"""
+    """在個股主表用代號(優先)或名稱找個股頁。
+    回傳 {'id', 'label', 'concept_ids'} 或 None;concept_ids 為該股「🔗 隸屬概念」的概念頁 ids。"""
     queries = []
     code = (code or "").strip()
     name = (name or "").strip()
@@ -75,9 +76,13 @@ def find_stock_page(code: str, name: str = "") -> dict | None:
         results = data.get("results", [])
         if results:
             page = results[0]
-            title = page.get("properties", {}).get("Name", {}).get("title", [])
+            props = page.get("properties", {})
+            title = props.get("Name", {}).get("title", [])
             label = "".join(t.get("plain_text", "") for t in title).strip()
-            return {"id": page["id"], "label": label}
+            concept_ids = [
+                r["id"] for r in props.get("🔗 隸屬概念", {}).get("relation", []) if r.get("id")
+            ]
+            return {"id": page["id"], "label": label, "concept_ids": concept_ids}
     return None
 
 
@@ -87,6 +92,7 @@ def add_event(
     date_end: str = "",
     event_type: str = "其他",
     stock_page_id: str = "",
+    concept_ids: list | None = None,
     note: str = "",
     source: str = "LINE",
     status: str = "",
@@ -112,6 +118,8 @@ def add_event(
         props["Quick Note"] = {"rich_text": [{"text": {"content": note[:1900]}}]}
     if stock_page_id:
         props["🔗 關聯個股"] = {"relation": [{"id": stock_page_id}]}
+    if concept_ids:
+        props["🔗 概念族群"] = {"relation": [{"id": cid} for cid in concept_ids]}
 
     data = _post(
         "/pages",

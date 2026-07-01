@@ -860,18 +860,21 @@ def _handle_timeline(text: str):
         date_end=data.date_end,
         event_type=data.event_type,
         stock_page_id=stock["id"] if stock else "",
+        concept_ids=stock.get("concept_ids") if stock else None,
         note=data.note,
         source="LINE",
     )
 
     date_txt = data.date_start + (f" ~ {data.date_end}" if data.date_end else "")
     linked = f"🔗 {stock['label']}" if stock else "(未關聯個股)"
+    n_concept = len(stock.get("concept_ids") or []) if stock else 0
+    concept_txt = f"（已自動歸類 {n_concept} 個概念）" if n_concept else ""
     reply = (
         "🗓️ 已寫入 Notion 時間軸\n"
         f"• 事件:{data.title}\n"
         f"• 日期:{date_txt}\n"
         f"• 類型:{data.event_type or '其他'}\n"
-        f"• 個股:{linked}"
+        f"• 個股:{linked}{concept_txt}"
         + (f"\n• 備註:{data.note}" if data.note else "")
         + warn
     )
