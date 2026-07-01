@@ -367,7 +367,8 @@ GUIDANCE = (
     "• 個股新聞\n• 產業新聞\n• 產業報告(券商研究報告)\n• 全球局勢\n• 知識(或筆記)\n\n"
     "範例:\n個股新聞\n光聖(6442)受惠CPO需求爆發…\n\n"
     "📎 也可以只貼連結,我會自動抓全文整理。\n"
-    "🔍 想查資料庫?用「查」開頭,例如:查 光聖最近的時程"
+    "🔍 想查資料庫?用「查」開頭,例如:查 光聖最近的時程\n"
+    "🛠️ 想更正?用「主表」改概念股主表、或「改」改某筆新聞(打「主表」或「改」看用法)"
 )
 
 # 查詢模式的觸發前綴(訊息開頭出現就進查詢,而非寫入)
@@ -606,6 +607,11 @@ def route_and_store(text: str) -> Result:
             )
         return _answer_query(question)
 
+    # 再看是不是「修正指令」(主表 / 改),是的話處理、不寫入新聞
+    correction = _handle_correction(text)
+    if correction is not None:
+        return correction
+
     cfg, content = detect_category(text)
     if cfg is None:
         raise NoCategoryError(GUIDANCE)
@@ -745,6 +751,205 @@ def _answer_query(question: str) -> Result:
     )
     answer = (completion.choices[0].message.content or "").strip() or "(沒有得到回應,請再試一次)"
     return Result(label="查詢", reply=f"🔍 {question}\n\n{answer}"[:4500])
+
+
+# ==========================================================
+# 修正指令:改概念股主表 / 改某一筆新聞
+# ==========================================================
+_MASTER_HELP = (
+    "🛠️ 概念股主表指令:\n"
+    "• 主表 加 <概念>:<個股>       例:主表 加 CPO:6442 光聖\n"
+    "• 主表 移除 <概念>:<個股>     例:主表 移除 光通訊:2330\n"
+    "• 主表 移除股 <個股>          例:主表 移除股 8111(從所有概念移除)\n"
+    "• 主表 合併 <概念A>:<概念B>   例:主表 合併 共同封裝光學:CPO\n"
+    "• 主表 刪除 <概念>            例:主表 刪除 半導體"
+)
+_EDIT_HELP = (
+    "🛠️ 修改某一筆新聞指令:\n"
+    "改 <分類> <關鍵字> <欄位>:<新值>\n"
+    "例:改 產業報告 全新 目標價:500元\n"
+    "(會找該分類中最近一筆含關鍵字的資料列來改)"
+)
+
+
+def _split_colon(s: str):
+    """用第一個半形或全形冒號切成 (左, 右)。"""
+    idx = min([i for i in (s.find(":"), s.find("：")) if i != -1], default=-1)
+    if idx == -1:
+        return s.strip(), ""
+    return s[:idx].strip(), s[idx + 1:].strip()
+
+
+def _find_concept_row(rows, concept: str):
+    """在主表找概念列(不分大小寫);回傳 (列號1-based, 該列) 或 (None, None)。"""
+    target = concept.strip().casefold()
+    for i, r in enumerate(rows[1:], start=2):
+        if r and r[0].strip().casefold() == target:
+            return i, r
+    return None, None
+
+
+def _cfg_by_word(word: str):
+    """把分類詞(產業報告/個股/…)對應到 CategoryConfig(依關鍵字由長到短)。"""
+    w = word.strip()
+    for kw, cfg in _KEYWORDS:
+        if w.startswith(kw):
+            return cfg
+    return None
+
+
+def _handle_correction(text: str):
+    """若是修正指令就處理並回 Result;否則回 None。"""
+    first = text.strip().splitlines()[0].strip() if text.strip() else ""
+    if first.startswith("主表"):
+        return _master_command(text)
+    for p in ("修改", "改"):
+        if first.startswith(p):
+            return _edit_row_command(text, p)
+    return None
+
+
+def _master_command(text: str) -> Result:
+    body = text.strip()[len("主表"):].strip()
+    if not body:
+        return Result("主表", _MASTER_HELP)
+    parts = body.split(None, 1)
+    action = parts[0]
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    ws = _get_worksheet(CONCEPT_MASTER_TAB, _CONCEPT_MASTER_HEADER)
+    rows = ws.get_all_values()
+    now = _now_str()
+
+    if action in ("加", "新增", "加入"):
+        concept, stocklist = _split_colon(rest)
+        stocks = _split_list(stocklist)
+        if not concept or not stocks:
+            return Result("主表", "用法:主表 加 <概念>:<個股>\n例:主表 加 CPO:6442 光聖")
+        ridx, r = _find_concept_row(rows, concept)
+        if ridx:
+            cur = _split_list(r[1]) if len(r) > 1 else []
+            added = [s for s in stocks if not any(_stock_key(s) == _stock_key(x) for x in cur)]
+            merged = cur + added
+            first = r[3] if (len(r) > 3 and r[3].strip()) else now
+            ws.update(values=[[r[0].strip(), ", ".join(merged), len(merged), first, now]],
+                      range_name=f"A{ridx}:E{ridx}", value_input_option="USER_ENTERED")
+            return Result("主表", f"✅ 【{r[0].strip()}】加入:{', '.join(added) or '(已存在,無新增)'}\n"
+                                   f"現有({len(merged)}檔):{', '.join(merged)}")
+        ws.append_row([concept, ", ".join(stocks), len(stocks), now, now], value_input_option="USER_ENTERED")
+        return Result("主表", f"✅ 新增概念【{concept}】({len(stocks)}檔):{', '.join(stocks)}")
+
+    if action in ("移除", "刪股", "移除個股"):
+        concept, stock = _split_colon(rest)
+        if not concept or not stock:
+            return Result("主表", "用法:主表 移除 <概念>:<個股>\n例:主表 移除 光通訊:2330")
+        ridx, r = _find_concept_row(rows, concept)
+        if not ridx:
+            return Result("主表", f"⚠️ 找不到概念【{concept}】")
+        cur = _split_list(r[1]) if len(r) > 1 else []
+        kept = [x for x in cur if _stock_key(x) != _stock_key(stock)]
+        if len(kept) == len(cur):
+            return Result("主表", f"⚠️ 【{concept}】裡沒有找到「{stock}」")
+        if kept:
+            first = r[3] if (len(r) > 3 and r[3].strip()) else now
+            ws.update(values=[[r[0].strip(), ", ".join(kept), len(kept), first, now]],
+                      range_name=f"A{ridx}:E{ridx}", value_input_option="USER_ENTERED")
+            return Result("主表", f"✅ 已從【{concept}】移除「{stock}」;剩 {len(kept)} 檔:{', '.join(kept)}")
+        ws.delete_rows(ridx)
+        return Result("主表", f"✅ 已從【{concept}】移除「{stock}」;該概念已無成分股,整列刪除")
+
+    if action in ("移除股", "全移除"):
+        stock = rest.strip()
+        if not stock:
+            return Result("主表", "用法:主表 移除股 <個股>\n例:主表 移除股 8111")
+        touched = []
+        for i, r in enumerate(rows[1:], start=2):
+            if not r or not r[0].strip():
+                continue
+            cur = _split_list(r[1]) if len(r) > 1 else []
+            kept = [x for x in cur if _stock_key(x) != _stock_key(stock)]
+            if len(kept) != len(cur):
+                touched.append((i, r[0].strip(), kept, r[3] if len(r) > 3 else now))
+        if not touched:
+            return Result("主表", f"⚠️ 所有概念裡都沒有找到「{stock}」")
+        # 由下往上寫/刪,避免刪列後列號位移
+        for i, cname, kept, first in sorted(touched, key=lambda t: -t[0]):
+            if kept:
+                ws.update(values=[[cname, ", ".join(kept), len(kept), first or now, now]],
+                          range_name=f"A{i}:E{i}", value_input_option="USER_ENTERED")
+            else:
+                ws.delete_rows(i)
+        return Result("主表", f"✅ 已從 {len(touched)} 個概念移除「{stock}」:{', '.join(t[1] for t in touched)}")
+
+    if action in ("合併", "併入", "改名"):
+        a, b = _split_colon(rest)
+        if not a or not b:
+            return Result("主表", "用法:主表 合併 <概念A>:<概念B>(A 併入 B)\n例:主表 合併 共同封裝光學:CPO")
+        ra, rowa = _find_concept_row(rows, a)
+        if not ra:
+            return Result("主表", f"⚠️ 找不到來源概念【{a}】")
+        astocks = _split_list(rowa[1]) if len(rowa) > 1 else []
+        afirst = rowa[3] if len(rowa) > 3 else now
+        rb, rowb = _find_concept_row(rows, b)
+        if rb:
+            bstocks = _split_list(rowb[1]) if len(rowb) > 1 else []
+            added = [s for s in astocks if not any(_stock_key(s) == _stock_key(x) for x in bstocks)]
+            merged = bstocks + added
+            bfirst = rowb[3] if (len(rowb) > 3 and rowb[3].strip()) else now
+            first = min(x for x in (bfirst, afirst) if x) if (bfirst or afirst) else now
+            ws.update(values=[[rowb[0].strip(), ", ".join(merged), len(merged), first, now]],
+                      range_name=f"A{rb}:E{rb}", value_input_option="USER_ENTERED")
+            ws.delete_rows(ra)
+            return Result("主表", f"✅ 已把【{a}】併入【{rowb[0].strip()}】,共 {len(merged)} 檔:{', '.join(merged)}")
+        ws.update(values=[[b]], range_name=f"A{ra}", value_input_option="USER_ENTERED")
+        return Result("主表", f"✅ 已把概念【{a}】改名為【{b}】")
+
+    if action in ("刪除", "刪", "刪概念"):
+        concept = rest.strip()
+        ridx, r = _find_concept_row(rows, concept)
+        if not ridx:
+            return Result("主表", f"⚠️ 找不到概念【{concept}】")
+        n_stock = len(_split_list(r[1])) if len(r) > 1 else 0
+        ws.delete_rows(ridx)
+        return Result("主表", f"✅ 已刪除概念【{r[0].strip()}】(原 {n_stock} 檔)")
+
+    return Result("主表", f"❓ 不認得的動作「{action}」。\n\n{_MASTER_HELP}")
+
+
+def _edit_row_command(text: str, prefix: str) -> Result:
+    body = text.strip()[len(prefix):].strip()
+    left, value = _split_colon(body)
+    toks = left.split()
+    if len(toks) < 3 or not value:
+        return Result("修改", _EDIT_HELP)
+    cat_word, field_word, keywords = toks[0], toks[-1], toks[1:-1]
+
+    cfg = _cfg_by_word(cat_word)
+    if not cfg:
+        return Result("修改", f"⚠️ 認不得分類「{cat_word}」。可用:個股新聞 / 產業新聞 / 產業報告 / 全球局勢 / 知識")
+
+    ws = _get_worksheet(cfg.tab, cfg.header)
+    rows = ws.get_all_values()
+    if len(rows) <= 1:
+        return Result("修改", f"⚠️ 【{cfg.label}】還沒有資料。")
+    header = rows[0]
+    col_idx = next((i for i, h in enumerate(header) if field_word in h), None)
+    if col_idx is None:
+        return Result("修改", f"⚠️ 找不到欄位「{field_word}」。\n可用欄位:{', '.join(header)}")
+
+    target_i, target_row = None, None
+    for i in range(len(rows) - 1, 0, -1):  # 由最新往回找
+        if all(k in " ".join(rows[i]) for k in keywords):
+            target_i, target_row = i + 1, rows[i]
+            break
+    if target_i is None:
+        return Result("修改", f"⚠️ 在【{cfg.label}】找不到含「{' '.join(keywords)}」的資料列。")
+
+    old = target_row[col_idx] if col_idx < len(target_row) else ""
+    a1 = gspread.utils.rowcol_to_a1(target_i, col_idx + 1)
+    ws.update(values=[[value]], range_name=a1, value_input_option="USER_ENTERED")
+    return Result("修改", f"✅ 已更新【{cfg.label}】第 {target_i} 列「{header[col_idx]}」:\n"
+                          f"{old or '(空)'} → {value}")
 
 
 # ==========================================================
