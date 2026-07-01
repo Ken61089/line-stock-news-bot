@@ -20,6 +20,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError, model_validator
 
 from web_fetch import fetch_article, FetchError
+import notion_timeline
 
 # ==========================================================
 # 設定
@@ -141,6 +142,17 @@ class _CoercedModel(BaseModel):
 class TimelineEvent(_CoercedModel):
     date: str = ""
     event: str = ""
+
+
+class TimelineInput(_CoercedModel):
+    """LINE「時程」指令解析結果:一句話 → 一筆時間軸事件。"""
+    stock_code: str = ""    # 台股代號(3-6 位數),沒有就空
+    stock_name: str = ""    # 個股名稱
+    title: str = ""         # 事件標題(精簡)
+    date_start: str = ""    # YYYY-MM-DD
+    date_end: str = ""      # YYYY-MM-DD(區間才有,如擴廠→量產)
+    event_type: str = ""    # 需為時程庫合法類型之一
+    note: str = ""          # 補充備註
 
 
 class StockNews(_CoercedModel):
@@ -374,12 +386,16 @@ GUIDANCE = (
     "範例:\n個股新聞\n光聖(6442)受惠CPO需求爆發…\n\n"
     "📎 也可以只貼連結,我會自動抓全文整理。\n"
     "🔍 想查資料庫?用「查」開頭,例如:查 光聖最近的時程\n"
+    "🗓️ 記時程?用「時程」開頭,例如:時程 8131福懋科 8月量產\n"
     "🛠️ 想更正?「主表」改概念股主表、「改」改某筆新聞、「改股 8111:6442 光聖」一次改遍所有分頁\n"
     "📖 打「說明」看完整指令總表"
 )
 
 # 查詢模式的觸發前綴(訊息開頭出現就進查詢,而非寫入)
 _QUERY_PREFIXES = ["查詢", "查", "問", "搜尋"]
+
+# 時程事件的觸發前綴(訊息開頭出現就寫進 Notion 時間軸,而非 Google Sheet)
+_TIMELINE_PREFIXES = ["時程", "事件", "行事曆"]
 
 # 「說明」指令:整段訊息完全等於這些字才觸發(避免新聞內文誤中)
 _HELP_WORDS = {"說明", "help", "指令", "幫助", "用法", "選單", "menu", "?", "？"}
@@ -395,6 +411,11 @@ _HELP_TEXT = (
     "━━ 查詢 ━━(「查」或「問」開頭)\n"
     "• 查 CPO有哪些股\n"
     "• 查 光聖屬於哪些概念\n"
+    "\n"
+    "━━ 記時程 ━━(「時程」開頭,寫進 Notion 時間軸)\n"
+    "• 時程 8131福懋科 8月量產\n"
+    "• 時程 2330 7/17 法說會\n"
+    "• 時程 3583 擴廠 8月試產、11月量產\n"
     "\n"
     "━━ 改錯:股號打錯 ━━\n"
     "• 改股 1514:1815 富喬 → 所有分頁一次改\n"
@@ -660,6 +681,11 @@ def route_and_store(text: str) -> Result:
     if correction is not None:
         return correction
 
+    # 「時程」開頭 → 寫進 Notion 時間軸(不走 Google Sheet)
+    timeline = _handle_timeline(text)
+    if timeline is not None:
+        return timeline
+
     cfg, content = detect_category(text)
     if cfg is None:
         raise NoCategoryError(GUIDANCE)
@@ -737,6 +763,121 @@ def _detect_query(text: str):
         if first_line.startswith(p):
             return s[len(p):].strip(" :：、,，.。?？\n")
     return None
+
+
+_TIMELINE_USAGE = (
+    "🗓️ 時程用法:「時程」後面用一句話描述,我會自動抓出個股、日期、事件並寫進 Notion 時間軸。\n"
+    "例如:\n"
+    "• 時程 8131福懋科 8月量產\n"
+    "• 時程 2330 7/17 法說會\n"
+    "• 時程 6442光聖 Q3 台北國際光電展\n"
+    "• 時程 3583 擴廠 8月試產、11月量產"
+)
+
+
+def _parse_timeline(body: str) -> TimelineInput:
+    """用 AI 把一句話拆成結構化時程事件。"""
+    today = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    system_prompt = (
+        "你是精準的台股時程資料結構化助手。只回傳合法 JSON,不寫任何說明,不要用 markdown 包起來。"
+    )
+    user_prompt = f"""請把下面這句話拆成一筆「股票時程事件」,嚴格回傳指定 JSON。
+
+【今天日期】{today}(台灣時間)
+【輸入】{body}
+
+規則:
+- stock_code:台股代號(3-6 位數字),沒有就給空字串。
+- stock_name:個股名稱(去掉代號),沒有就空字串。
+- title:精簡事件標題(例如「Q2 法說會」「桃園三廠量產」「台北國際光電展」)。
+- date_start / date_end:一律 YYYY-MM-DD。只寫月份(如「8月」)就用該月 1 日;只寫季(Q1~Q4)用該季首月 1 日;沒寫年份用「今天日期」推最近的合理年份(通常今年或明年,不要用過去)。單一時間點只填 date_start;有明確區間(如「8月試產、11月量產」)才填 date_end。
+- event_type:必須從這個清單挑最接近的一個:擴廠進度、試產進度、量產進度、發行可轉債、CB掛牌、CB拆解、法說會、股東會、除權息、增減資、營收公布、財報公布、財報利空/多、展覽/政策、其他。
+- note:原句裡的補充資訊(沒有就空字串)。
+
+只回傳這個結構的 JSON:
+{{"stock_code":"","stock_name":"","title":"","date_start":"","date_end":"","event_type":"","note":""}}
+"""
+    last_err = None
+    for _ in range(2):
+        try:
+            completion = _get_ai_client().chat.completions.create(
+                model=AI_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=600,
+            )
+            raw = completion.choices[0].message.content or ""
+            return TimelineInput.model_validate(_safe_json_loads(raw))
+        except (json.JSONDecodeError, ValidationError) as e:
+            last_err = e
+    raise RuntimeError(f"AI 解析時程失敗(已重試):{last_err}")
+
+
+def _handle_timeline(text: str):
+    """開頭是「時程」前綴 → 寫進 Notion 時間軸並回覆;否則回傳 None。"""
+    s = text.strip()
+    first_line = s.splitlines()[0].strip() if s else ""
+    matched = next((p for p in _TIMELINE_PREFIXES if first_line.startswith(p)), None)
+    if matched is None:
+        return None
+
+    body = s[len(matched):].strip(" :：、,，.。\n")
+    if not body:
+        raise NoCategoryError(_TIMELINE_USAGE)
+
+    if not notion_timeline.enabled():
+        raise NoCategoryError(
+            "⚠️ 時程功能尚未啟用:請先在環境變數設定 NOTION_TOKEN"
+            "(Notion integration 密鑰,並把「股票投資大腦」頁面分享給該 integration)。"
+        )
+
+    data = _parse_timeline(body)
+    if not data.title:
+        data.title = body[:60]
+    if not data.date_start:
+        raise NoCategoryError(
+            f"🗓️ 我看不出「{body}」裡的日期。請補上時間,例如「8月量產」「7/17 法說會」「Q3」。"
+        )
+
+    # 找個股頁(用代號優先);找不到就建無關聯事件並提醒
+    stock = None
+    warn = ""
+    try:
+        stock = notion_timeline.find_stock_page(data.stock_code, data.stock_name)
+    except notion_timeline.NotionError as e:
+        logger.warning("查個股頁失敗:%s", e)
+    if stock is None and (data.stock_code or data.stock_name):
+        warn = (
+            f"\n⚠️ 個股主表查無「{(data.stock_code + ' ' + data.stock_name).strip()}」,"
+            "已建事件但未關聯(概念分類需要關聯個股)。可先在個股主表新增此股,再手動連結。"
+        )
+
+    result = notion_timeline.add_event(
+        title=data.title,
+        date_start=data.date_start,
+        date_end=data.date_end,
+        event_type=data.event_type,
+        stock_page_id=stock["id"] if stock else "",
+        note=data.note,
+        source="LINE",
+    )
+
+    date_txt = data.date_start + (f" ~ {data.date_end}" if data.date_end else "")
+    linked = f"🔗 {stock['label']}" if stock else "(未關聯個股)"
+    reply = (
+        "🗓️ 已寫入 Notion 時間軸\n"
+        f"• 事件:{data.title}\n"
+        f"• 日期:{date_txt}\n"
+        f"• 類型:{data.event_type or '其他'}\n"
+        f"• 個股:{linked}"
+        + (f"\n• 備註:{data.note}" if data.note else "")
+        + warn
+    )
+    if result.get("url"):
+        reply += f"\n{result['url']}"
+    return Result(label="時程", reply=reply)
 
 
 def _gather_corpus() -> str:
