@@ -761,6 +761,7 @@ _MASTER_HELP = (
     "• 主表 加 <概念>:<個股>       例:主表 加 CPO:6442 光聖\n"
     "• 主表 移除 <概念>:<個股>     例:主表 移除 光通訊:2330\n"
     "• 主表 移除股 <個股>          例:主表 移除股 8111(從所有概念移除)\n"
+    "• 主表 改股 <舊>:<新>         例:主表 改股 8111:6442 光聖(股號打錯一次改掉)\n"
     "• 主表 合併 <概念A>:<概念B>   例:主表 合併 共同封裝光學:CPO\n"
     "• 主表 刪除 <概念>            例:主表 刪除 半導體"
 )
@@ -880,6 +881,33 @@ def _master_command(text: str) -> Result:
             else:
                 ws.delete_rows(i)
         return Result("主表", f"✅ 已從 {len(touched)} 個概念移除「{stock}」:{', '.join(t[1] for t in touched)}")
+
+    if action in ("改股", "換股", "更正股", "改代號"):
+        old, new = _split_colon(rest)
+        if not old or not new:
+            return Result("主表", "用法:主表 改股 <舊>:<新>\n例:主表 改股 8111:6442 光聖")
+        oldkey = _stock_key(old)
+        touched = []
+        for i, r in enumerate(rows[1:], start=2):
+            if not r or not r[0].strip():
+                continue
+            cur = _split_list(r[1]) if len(r) > 1 else []
+            if not any(_stock_key(x) == oldkey for x in cur):
+                continue
+            newlist = []
+            for x in cur:
+                x2 = new if _stock_key(x) == oldkey else x
+                if not any(_stock_key(x2) == _stock_key(y) for y in newlist):
+                    newlist.append(x2)
+            first = r[3] if (len(r) > 3 and r[3].strip()) else now
+            touched.append((i, r[0].strip(), newlist, first))
+        if not touched:
+            return Result("主表", f"⚠️ 主表裡沒有任何概念含「{old}」")
+        for i, cname, newlist, first in touched:
+            ws.update(values=[[cname, ", ".join(newlist), len(newlist), first, now]],
+                      range_name=f"A{i}:E{i}", value_input_option="USER_ENTERED")
+        return Result("主表", f"✅ 已把「{old}」更正為「{new}」,更新 {len(touched)} 個概念:"
+                              f"{', '.join(t[1] for t in touched)}")
 
     if action in ("合併", "併入", "改名"):
         a, b = _split_colon(rest)
