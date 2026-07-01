@@ -368,7 +368,7 @@ GUIDANCE = (
     "範例:\n個股新聞\n光聖(6442)受惠CPO需求爆發…\n\n"
     "📎 也可以只貼連結,我會自動抓全文整理。\n"
     "🔍 想查資料庫?用「查」開頭,例如:查 光聖最近的時程\n"
-    "🛠️ 想更正?用「主表」改概念股主表、或「改」改某筆新聞(打「主表」或「改」看用法)"
+    "🛠️ 想更正?「主表」改概念股主表、「改」改某筆新聞、「改股 8111:6442 光聖」一次改遍所有分頁"
 )
 
 # 查詢模式的觸發前綴(訊息開頭出現就進查詢,而非寫入)
@@ -804,10 +804,81 @@ def _handle_correction(text: str):
     first = text.strip().splitlines()[0].strip() if text.strip() else ""
     if first.startswith("主表"):
         return _master_command(text)
+    # 全面改股(所有分頁)— 需在通用「改」之前判斷
+    for p in ("改股", "換股", "全部改股"):
+        if first.startswith(p):
+            old, new = _split_colon(first[len(p):])
+            if not old or not new:
+                return Result("改股", "用法:改股 <舊>:<新>(一次修正所有分頁)\n例:改股 8111:6442 光聖")
+            return _global_fix_stock(old, new)
     for p in ("修改", "改"):
         if first.startswith(p):
             return _edit_row_command(text, p)
     return None
+
+
+def _global_fix_stock(old: str, new: str) -> Result:
+    """把股號 old 在『所有分頁』(各新聞分頁的個股欄 + 概念股主表成分股)一次換成 new。"""
+    now = _now_str()
+    oldkey = _stock_key(old)
+    wb = _open_workbook()
+    report = []
+
+    def _fix_cell(stocks):
+        out = []
+        for x in stocks:
+            x2 = new if _stock_key(x) == oldkey else x
+            if not any(_stock_key(x2) == _stock_key(y) for y in out):
+                out.append(x2)
+        return out
+
+    # 1) 概念股主表(整列 A:E,順便更新個股數與最近出現)
+    try:
+        mws = wb.worksheet(CONCEPT_MASTER_TAB)
+        rows = mws.get_all_values()
+        n = 0
+        for i, r in enumerate(rows[1:], start=2):
+            cur = _split_list(r[1]) if len(r) > 1 else []
+            if not any(_stock_key(x) == oldkey for x in cur):
+                continue
+            newlist = _fix_cell(cur)
+            first_seen = r[3] if (len(r) > 3 and r[3].strip()) else now
+            mws.update(values=[[r[0].strip(), ", ".join(newlist), len(newlist), first_seen, now]],
+                       range_name=f"A{i}:E{i}", value_input_option="USER_ENTERED")
+            n += 1
+        if n:
+            report.append(f"概念股主表:{n} 個概念")
+    except gspread.WorksheetNotFound:
+        pass
+
+    # 2) 各新聞分頁的個股欄
+    for cfg in ALL_CONFIGS:
+        try:
+            ws = wb.worksheet(cfg.tab)
+        except gspread.WorksheetNotFound:
+            continue
+        rows = ws.get_all_values()
+        if not rows:
+            continue
+        col = next((j for j, h in enumerate(rows[0]) if h.strip() in ("個股", "提及個股")), None)
+        if col is None:
+            continue
+        n = 0
+        for i, r in enumerate(rows[1:], start=2):
+            if len(r) <= col:
+                continue
+            stocks = _split_list(r[col])
+            if not any(_stock_key(x) == oldkey for x in stocks):
+                continue
+            ws.update(values=[[", ".join(_fix_cell(stocks))]],
+                      range_name=gspread.utils.rowcol_to_a1(i, col + 1), value_input_option="USER_ENTERED")
+            n += 1
+        if n:
+            report.append(f"{cfg.label}:{n} 列")
+
+    if not report:
+        return Result("改股", f"⚠️ 所有分頁裡都沒有找到「{old}」")
+    return Result("改股", f"✅ 已把「{old}」全面更正為「{new}」:\n" + "\n".join("• " + x for x in report))
 
 
 def _master_command(text: str) -> Result:
