@@ -6,6 +6,7 @@ CB拆解/經濟數據公布…等),依排程主動推播到指定 LINE 群組。
 
 排程(台灣時間,可用環境變數覆寫):
   - 每天 07:00      → 推「今天」的事件(當天沒事件則不發,避免洗版)
+  - 每天 21:00      → 推「明天」的事件(明天沒事件則不發)
   - 每週日 21:00    → 推「下週(下週一~週日)」的行事曆彙整
 
 需要的環境變數:
@@ -13,8 +14,9 @@ CB拆解/經濟數據公布…等),依排程主動推播到指定 LINE 群組。
   LINE_NOTIFY_TARGET_ID       推播目標:群組 groupId(或個人 userId)。把機器人拉進
                               群組後,在群裡傳「id」給機器人即可查到。
   NOTION_TOKEN / NOTION_TIMELINE_DS   時程庫(沿用 notion_timeline.py 的設定)
-  NOTIFY_DAILY_TIME           每日推播時刻,預設 "07:00"
-  NOTIFY_WEEKLY_TIME          每週推播時刻,預設 "21:00"
+  NOTIFY_DAILY_TIME           每日推「當日」時刻,預設 "07:00"
+  NOTIFY_TOMORROW_TIME        每日推「明日」時刻,預設 "21:00"
+  NOTIFY_WEEKLY_TIME          每週推「下週」時刻,預設 "21:00"
   NOTIFY_WEEKLY_DOW           每週推播星期(0=一…6=日),預設 "6"(週日)
   NOTIFY_EXCLUDE_TYPES        不推播的事件類型(逗號分隔),預設空
   ENABLE_SCHEDULER            設 "0" 可停用內建排程,預設啟用
@@ -110,8 +112,9 @@ def _fmt_line(ev: dict, with_date: bool = False) -> str:
     return f"{emoji} {prefix}[{ev['type']}] {ev['title']}{span}".rstrip()
 
 
-def format_daily(events: list[dict], day: datetime.date) -> str:
-    head = f"☀️ 今日投資行事曆 {day.month}/{day.day}(週{_WEEKDAY_ZH[day.weekday()]})"
+def format_daily(events: list[dict], day: datetime.date,
+                 label: str = "今日", emoji: str = "☀️") -> str:
+    head = f"{emoji} {label}投資行事曆 {day.month}/{day.day}(週{_WEEKDAY_ZH[day.weekday()]})"
     body = "\n".join(_fmt_line(ev) for ev in events)
     return f"{head}\n\n{body}"
 
@@ -147,7 +150,7 @@ def push(text: str, target_id: str = "") -> None:
     logger.info("已推播到 %s(%d 字)", target[:8] + "…", len(text))
 
 
-# ---- 兩個排程任務 ----
+# ---- 排程任務 ----
 def notify_daily(dry_run: bool = False) -> str | None:
     today = datetime.datetime.now(TW_TZ).date()
     events = query_events(today, today)
@@ -155,6 +158,19 @@ def notify_daily(dry_run: bool = False) -> str | None:
         logger.info("今日(%s)無事件,不推播。", today)
         return None
     msg = format_daily(events, today)
+    if dry_run:
+        return msg
+    push(msg)
+    return msg
+
+
+def notify_tomorrow(dry_run: bool = False) -> str | None:
+    tomorrow = datetime.datetime.now(TW_TZ).date() + datetime.timedelta(days=1)
+    events = query_events(tomorrow, tomorrow)
+    if not events:
+        logger.info("明日(%s)無事件,不推播。", tomorrow)
+        return None
+    msg = format_daily(events, tomorrow, label="明日", emoji="🌙")
     if dry_run:
         return msg
     push(msg)
@@ -202,6 +218,7 @@ def maybe_start_scheduler() -> None:
 
     tz = pytz.timezone("Asia/Taipei")
     d_h, d_m = _parse_hhmm(os.environ.get("NOTIFY_DAILY_TIME", "07:00"), 7, 0)
+    t_h, t_m = _parse_hhmm(os.environ.get("NOTIFY_TOMORROW_TIME", "21:00"), 21, 0)
     w_h, w_m = _parse_hhmm(os.environ.get("NOTIFY_WEEKLY_TIME", "21:00"), 21, 0)
     w_dow = int(os.environ.get("NOTIFY_WEEKLY_DOW", "6"))  # 0=一…6=日
 
@@ -211,14 +228,19 @@ def maybe_start_scheduler() -> None:
         id="daily", replace_existing=True,
     )
     sched.add_job(
+        _safe(notify_tomorrow), CronTrigger(hour=t_h, minute=t_m, timezone=tz),
+        id="tomorrow", replace_existing=True,
+    )
+    sched.add_job(
         _safe(notify_weekly), CronTrigger(day_of_week=w_dow, hour=w_h, minute=w_m, timezone=tz),
         id="weekly", replace_existing=True,
     )
     sched.start()
     _scheduler = sched
     logger.info(
-        "行事曆排程已啟動:每日 %02d:%02d 推當日、每週 %s %02d:%02d 推下週(台灣時間)。",
-        d_h, d_m, _WEEKDAY_ZH[w_dow], w_h, w_m,
+        "行事曆排程已啟動:每日 %02d:%02d 推當日、每日 %02d:%02d 推明日、"
+        "每週 %s %02d:%02d 推下週(台灣時間)。",
+        d_h, d_m, t_h, t_m, _WEEKDAY_ZH[w_dow], w_h, w_m,
     )
 
 
@@ -249,10 +271,12 @@ if __name__ == "__main__":
 
     if mode == "daily":
         out = notify_daily(dry_run=dry)
+    elif mode == "tomorrow":
+        out = notify_tomorrow(dry_run=dry)
     elif mode == "weekly":
         out = notify_weekly(dry_run=dry)
     else:
-        print("用法:python calendar_notify.py [daily|weekly] [--dry]")
+        print("用法:python calendar_notify.py [daily|tomorrow|weekly] [--dry]")
         sys.exit(1)
 
     if dry:
