@@ -57,6 +57,33 @@ def _post(path: str, payload: dict) -> dict:
     return r.json()
 
 
+def _patch(path: str, payload: dict) -> dict:
+    r = httpx.patch(f"{_API}{path}", headers=_headers(), json=payload, timeout=20)
+    if r.status_code >= 300:
+        raise NotionError(f"Notion API {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def archive_events_by_type_date(event_type: str, date_iso: str) -> int:
+    """封存(移除)指定「事件類型」且「關鍵日期」等於 date_iso 的所有事件,回傳筆數。
+    用於「每日關注」重打時,先清掉同一天的舊筆記再寫新的(採最新版)。"""
+    payload = {
+        "filter": {
+            "and": [
+                {"property": "事件類型", "select": {"equals": event_type}},
+                {"property": "關鍵日期", "date": {"equals": date_iso}},
+            ]
+        },
+        "page_size": 100,
+    }
+    data = _post(f"/data_sources/{TIMELINE_DS}/query", payload)
+    n = 0
+    for pg in data.get("results", []):
+        _patch(f"/pages/{pg['id']}", {"archived": True})
+        n += 1
+    return n
+
+
 def find_stock_page(code: str, name: str = "") -> dict | None:
     """在個股主表用代號(優先)或名稱找個股頁。
     回傳 {'id', 'label', 'concept_ids'} 或 None;concept_ids 為該股「🔗 隸屬概念」的概念頁 ids。"""

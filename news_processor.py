@@ -408,7 +408,8 @@ _WATCHLIST_USAGE = (
     "關注\n"
     "2330 台積電 站上季線再追\n"
     "3661 世芯 觀察缺口\n"
-    "(想指定今天請用「關注 今天 ...」;預設是隔天)"
+    "(想指定今天請用「關注 今天 ...」;預設是隔天)\n"
+    "📌 同一天再打一次「關注」= 整批更新成最新版(會蓋掉當天舊的)"
 )
 
 # 「說明」指令:整段訊息完全等於這些字才觸發(避免新聞內文誤中)
@@ -971,6 +972,13 @@ def _handle_watchlist(text: str):
     target = datetime.datetime.now(notion_timeline.TW_TZ).date() + datetime.timedelta(days=offset)
     date_iso = target.isoformat()
 
+    # 採最新版:先清掉同一天的舊「每日關注」筆記,再寫入這次的
+    replaced = 0
+    try:
+        replaced = notion_timeline.archive_events_by_type_date(_WATCHLIST_TYPE, date_iso)
+    except notion_timeline.NotionError as e:
+        logger.warning("關注:清除舊筆記失敗:%s", e)
+
     added = []
     for item in items:
         # 盡量關聯個股(用代號優先);關聯不到就只記事件、不自動新增個股(避免主表被盯盤筆記灌爆)
@@ -999,10 +1007,11 @@ def _handle_watchlist(text: str):
     body = "\n".join(
         f"• {name} {'🔗' if linked else ''}".rstrip() for name, linked in added
     )
+    tail = f"(共 {len(ok)} 筆" + (f",已覆蓋前一版 {replaced} 筆)" if replaced else ")")
     reply = (
-        f"👀 已加入{label_day}({m}/{d})關注,{label_day}早上 07:00 會隨推播通知一次:\n"
+        f"👀 已更新{label_day}({m}/{d})關注,{label_day}早上 07:00 會隨推播通知一次:\n"
         f"{body}\n"
-        f"(共 {len(ok)} 筆)"
+        f"{tail}"
     )
     return Result(label="關注", reply=reply)
 
