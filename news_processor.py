@@ -841,17 +841,33 @@ def _handle_timeline(text: str):
             f"🗓️ 我看不出「{body}」裡的日期。請補上時間,例如「8月量產」「7/17 法說會」「Q3」。"
         )
 
-    # 找個股頁(用代號優先);找不到就建無關聯事件並提醒
+    # 找個股頁(用代號優先);找不到就自動新增到個股主表再關聯
     stock = None
     warn = ""
+    auto_created = False
     try:
         stock = notion_timeline.find_stock_page(data.stock_code, data.stock_name)
     except notion_timeline.NotionError as e:
         logger.warning("查個股頁失敗:%s", e)
+
     if stock is None and (data.stock_code or data.stock_name):
+        auto_create = os.environ.get("AUTO_CREATE_STOCK", "1") != "0"
+        if auto_create:
+            try:
+                stock = notion_timeline.create_stock_page(data.stock_code, data.stock_name)
+                auto_created = True
+            except notion_timeline.NotionError as e:
+                logger.warning("自動新增個股失敗:%s", e)
+        if stock is None:
+            warn = (
+                f"\n⚠️ 個股主表查無「{(data.stock_code + ' ' + data.stock_name).strip()}」,"
+                "已建事件但未關聯(概念分類需要關聯個股)。可先在個股主表新增此股,再手動連結。"
+            )
+
+    if auto_created:
         warn = (
-            f"\n⚠️ 個股主表查無「{(data.stock_code + ' ' + data.stock_name).strip()}」,"
-            "已建事件但未關聯(概念分類需要關聯個股)。可先在個股主表新增此股,再手動連結。"
+            f"\n🆕 個股主表原本沒有「{stock['label']}」,已自動新增並關聯。"
+            "(概念分類請之後到該股補上「隸屬概念」,或用其他新聞餵入)"
         )
 
     # 事件標題一律帶上公司名,行事曆才看得出是哪家公司(標題已含名稱/代號就不重複加)

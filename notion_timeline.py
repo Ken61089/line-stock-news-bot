@@ -86,6 +86,21 @@ def find_stock_page(code: str, name: str = "") -> dict | None:
     return None
 
 
+def create_stock_page(code: str, name: str) -> dict:
+    """在個股主表新增一檔(只填 Name,格式「代號 名稱」)。回傳 {'id','label','concept_ids':[]}。"""
+    code = (code or "").strip()
+    name = (name or "").strip()
+    label = f"{code} {name}".strip() or code or name or "(未命名)"
+    data = _post(
+        "/pages",
+        {
+            "parent": {"type": "data_source_id", "data_source_id": STOCK_DS},
+            "properties": {"Name": {"title": [{"text": {"content": label[:200]}}]}},
+        },
+    )
+    return {"id": data.get("id", ""), "label": label, "concept_ids": []}
+
+
 def add_event(
     title: str,
     date_start: str,
