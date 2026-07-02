@@ -26,6 +26,7 @@ from linebot.v3.messaging import (
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 from news_processor import route_and_store, NoCategoryError
+import calendar_notify
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -43,6 +44,9 @@ PORT = int(os.environ.get("PORT", "8080"))
 app = Flask(__name__)
 parser = WebhookParser(CHANNEL_SECRET)
 _config = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+
+# 掛上「Notion 行事曆 → LINE 群組」定時推播排程(每日 07:00 當日、每週日 21:00 下週)
+calendar_notify.maybe_start_scheduler()
 
 
 # ---- LINE 傳訊小工具 ----
@@ -110,12 +114,19 @@ def callback():
             continue
 
         user_id = getattr(event.source, "user_id", "") or ""
+        group_id = getattr(event.source, "group_id", "") or ""
+        room_id = getattr(event.source, "room_id", "") or ""
         text = (event.message.text or "").strip()
         reply_token = event.reply_token
 
-        # 查自己的 user id
+        # 查 id:在群組/聊天室會一併回傳 group/room id(設定推播目標時要用)
         if text.lower() == "id":
-            _say(reply_token, user_id, f"你的 LINE user id:\n{user_id}")
+            lines = [f"你的 LINE user id:\n{user_id}"]
+            if group_id:
+                lines.append(f"\n本群組 group id(推播目標請用這個):\n{group_id}")
+            if room_id:
+                lines.append(f"\n本聊天室 room id(推播目標請用這個):\n{room_id}")
+            _say(reply_token, user_id, "\n".join(lines))
             continue
 
         # 白名單檢查
