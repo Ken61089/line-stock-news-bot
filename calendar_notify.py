@@ -117,8 +117,24 @@ def _fmt_line(ev: dict, with_date: bool = False) -> str:
 def format_daily(events: list[dict], day: datetime.date,
                  label: str = "今日", emoji: str = "☀️") -> str:
     head = f"{emoji} {label}投資行事曆 {day.month}/{day.day}(週{_WEEKDAY_ZH[day.weekday()]})"
-    body = "\n".join(_fmt_line(ev) for ev in events)
+    body = "\n".join(_fmt_line(ev) for ev in events) if events else f"(今日無排定事件)"
     return f"{head}\n\n{body}"
+
+
+def format_earnings_preview(events: list[dict], today: datetime.date) -> str:
+    """法說會提前預告區塊,依日期排序,標倒數天數。"""
+    lines = []
+    for ev in sorted(events, key=lambda e: e["start"]):
+        try:
+            dd = datetime.date.fromisoformat(ev["start"])
+        except ValueError:
+            continue
+        days = (dd - today).days
+        when = "今天" if days == 0 else f"還有{days}天"
+        w = _WEEKDAY_ZH[dd.weekday()]
+        emoji = TYPE_EMOJI.get(ev["type"], "🎤")
+        lines.append(f"{emoji} {dd.month}/{dd.day}(週{w}・{when}) {ev['title']}")
+    return "📢 法說會預告\n" + "\n".join(lines)
 
 
 def format_weekly(events: list[dict], start: datetime.date, end: datetime.date) -> str:
@@ -152,14 +168,31 @@ def push(text: str, target_id: str = "") -> None:
     logger.info("已推播到 %s(%d 字)", target[:8] + "…", len(text))
 
 
+# 法說會提前預告:當天 + 前幾天都通知(預設 2 = 當天+前2天共 3 個早上)
+EARNINGS_LEAD_DAYS = int(os.environ.get("EARNINGS_LEAD_DAYS", "2"))
+_PREVIEW_TYPES = {"法說會"}
+
+
 # ---- 排程任務 ----
 def notify_daily(dry_run: bool = False) -> str | None:
     today = datetime.datetime.now(TW_TZ).date()
     events = query_events(today, today)
-    if not events:
-        logger.info("今日(%s)無事件,不推播。", today)
+
+    # 法說會提前預告:未來 1~EARNINGS_LEAD_DAYS 天內的法說會(僅預告類型)
+    preview = []
+    if EARNINGS_LEAD_DAYS > 0:
+        ahead = query_events(today + datetime.timedelta(days=1),
+                             today + datetime.timedelta(days=EARNINGS_LEAD_DAYS))
+        preview = [e for e in ahead if e["type"] in _PREVIEW_TYPES]
+
+    if not events and not preview:
+        logger.info("今日(%s)無事件、近日無法說會,不推播。", today)
         return None
-    msg = format_daily(events, today)
+
+    parts = [format_daily(events, today)]
+    if preview:
+        parts.append(format_earnings_preview(preview, today))
+    msg = "\n\n".join(parts)
     if dry_run:
         return msg
     push(msg)
