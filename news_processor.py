@@ -854,8 +854,16 @@ def _handle_timeline(text: str):
             "已建事件但未關聯(概念分類需要關聯個股)。可先在個股主表新增此股,再手動連結。"
         )
 
+    # 事件標題一律帶上公司名,行事曆才看得出是哪家公司(標題已含名稱/代號就不重複加)
+    company = (stock["label"] if stock else "") or data.stock_name or data.stock_code
+    has_company = bool(
+        (data.stock_name and data.stock_name in data.title)
+        or (data.stock_code and data.stock_code in data.title)
+    )
+    event_title = data.title if (has_company or not company) else f"{company} {data.title}".strip()
+
     result = notion_timeline.add_event(
-        title=data.title,
+        title=event_title,
         date_start=data.date_start,
         date_end=data.date_end,
         event_type=data.event_type,
@@ -871,7 +879,7 @@ def _handle_timeline(text: str):
     concept_txt = f"（已自動歸類 {n_concept} 個概念）" if n_concept else ""
     reply = (
         "🗓️ 已寫入 Notion 時間軸\n"
-        f"• 事件:{data.title}\n"
+        f"• 事件:{event_title}\n"
         f"• 日期:{date_txt}\n"
         f"• 類型:{data.event_type or '其他'}\n"
         f"• 個股:{linked}{concept_txt}"
