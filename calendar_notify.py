@@ -225,6 +225,7 @@ def maybe_start_scheduler() -> None:
     t_h, t_m = _parse_hhmm(os.environ.get("NOTIFY_TOMORROW_TIME", "21:00"), 21, 0)
     w_h, w_m = _parse_hhmm(os.environ.get("NOTIFY_WEEKLY_TIME", "21:00"), 21, 0)
     w_dow = int(os.environ.get("NOTIFY_WEEKLY_DOW", "6"))  # 0=一…6=日
+    f_h, f_m = _parse_hhmm(os.environ.get("FETCH_EARNINGS_TIME", "06:30"), 6, 30)
 
     sched = BackgroundScheduler(timezone=tz)
     sched.add_job(
@@ -239,12 +240,25 @@ def maybe_start_scheduler() -> None:
         _safe(notify_weekly), CronTrigger(day_of_week=w_dow, hour=w_h, minute=w_m, timezone=tz),
         id="weekly", replace_existing=True,
     )
+    # 每天 06:30(推播前)自動抓 money-link 法說會,更新追蹤股的時程
+    try:
+        import fetchers
+        sched.add_job(
+            _safe(fetchers.sync_earnings_calls),
+            CronTrigger(hour=f_h, minute=f_m, timezone=tz),
+            id="fetch_earnings", replace_existing=True,
+        )
+        fetch_log = f"、每日 {f_h:02d}:{f_m:02d} 抓法說會"
+    except Exception:  # noqa: BLE001
+        logger.exception("fetchers 掛載失敗,法說會自動抓取不啟用")
+        fetch_log = ""
+
     sched.start()
     _scheduler = sched
     logger.info(
         "行事曆排程已啟動:每日 %02d:%02d 推當日、每日 %02d:%02d 推明日、"
-        "每週 %s %02d:%02d 推下週(台灣時間)。",
-        d_h, d_m, t_h, t_m, _WEEKDAY_ZH[w_dow], w_h, w_m,
+        "每週 %s %02d:%02d 推下週%s(台灣時間)。",
+        d_h, d_m, t_h, t_m, _WEEKDAY_ZH[w_dow], w_h, w_m, fetch_log,
     )
 
 

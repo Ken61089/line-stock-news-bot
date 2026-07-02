@@ -436,6 +436,9 @@ _HELP_TEXT = (
     "• 關注 2330 台積電 站上季線再追\n"
     "• 多檔:「關注」換行後一行一檔\n"
     "\n"
+    "━━ 法說會自動更新 ━━(每天自動抓,也可手動)\n"
+    "• 打「更新法說會」→ 立即抓追蹤股的法說會進時程\n"
+    "\n"
     "━━ 改錯:股號打錯 ━━\n"
     "• 改股 1514:1815 富喬 → 所有分頁一次改\n"
     "• 主表 改股 1514:1815 富喬 → 只改主表\n"
@@ -709,6 +712,11 @@ def route_and_store(text: str) -> Result:
     watchlist = _handle_watchlist(text)
     if watchlist is not None:
         return watchlist
+
+    # 「更新法說會/抓法說會」→ 立即抓 money-link 法說會寫進時程庫
+    fetched = _handle_fetch_earnings(text)
+    if fetched is not None:
+        return fetched
 
     cfg, content = detect_category(text)
     if cfg is None:
@@ -1014,6 +1022,31 @@ def _handle_watchlist(text: str):
         f"{tail}"
     )
     return Result(label="關注", reply=reply)
+
+
+_FETCH_EARNINGS_PREFIXES = ("更新法說會", "抓法說會", "法說會更新")
+
+
+def _handle_fetch_earnings(text: str):
+    """開頭是「更新法說會/抓法說會」→ 立即抓 money-link 法說會寫進時程庫;否則回傳 None。"""
+    first = text.strip().splitlines()[0].strip() if text.strip() else ""
+    if not any(first.startswith(p) for p in _FETCH_EARNINGS_PREFIXES):
+        return None
+    if not notion_timeline.enabled():
+        raise NoCategoryError("⚠️ 尚未啟用:請先設定 NOTION_TOKEN。")
+
+    import fetchers
+    res = fetchers.sync_earnings_calls()
+    lines = [
+        "📡 法說會自動更新完成(來源:money-link)",
+        f"比對追蹤股 {res['matched']} 檔 → 新增 {res['added']} 筆、已存在略過 {res['skipped']} 筆",
+    ]
+    if res["added_items"]:
+        lines.append("")
+        lines += [f"• {it}" for it in res["added_items"][:20]]
+    elif res["added"] == 0:
+        lines.append("(追蹤股近期法說會都已在時程庫,無新增)")
+    return Result(label="法說會更新", reply="\n".join(lines))
 
 
 def _gather_corpus() -> str:

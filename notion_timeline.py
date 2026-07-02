@@ -128,6 +128,35 @@ def create_stock_page(code: str, name: str) -> dict:
     return {"id": data.get("id", ""), "label": label, "concept_ids": []}
 
 
+def list_stocks() -> list[dict]:
+    """列出個股主表所有個股,回傳 [{'id','label','code','concept_ids'}](自動翻頁)。"""
+    results: list[dict] = []
+    cursor = None
+    while True:
+        payload = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        data = _post(f"/data_sources/{STOCK_DS}/query", payload)
+        for page in data.get("results", []):
+            props = page.get("properties", {})
+            title = props.get("Name", {}).get("title", [])
+            label = "".join(t.get("plain_text", "") for t in title).strip()
+            m = _STOCK_CODE_RE.search(label)
+            concept_ids = [
+                r["id"] for r in props.get("🔗 隸屬概念", {}).get("relation", []) if r.get("id")
+            ]
+            results.append({
+                "id": page["id"],
+                "label": label,
+                "code": m.group(0) if m else "",
+                "concept_ids": concept_ids,
+            })
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return results
+
+
 def add_event(
     title: str,
     date_start: str,
