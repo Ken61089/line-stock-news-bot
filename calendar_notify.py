@@ -39,7 +39,7 @@ TYPE_EMOJI = {
     "法說會": "🎤", "股東會": "🏛️", "CB掛牌": "📈", "CB拆解": "✂️",
     "發行可轉債": "💵", "除權息": "💰", "增減資": "🔀", "營收公布": "📊",
     "財報公布": "📋", "財報利空/多": "⚠️", "擴廠進度": "🏭", "試產進度": "🧪",
-    "量產進度": "🚀", "展覽/政策": "📰", "盤後隨筆": "📝", "其他": "📌",
+    "量產進度": "🚀", "展覽/政策": "📰", "盤後隨筆": "📝", "每日關注": "👀", "其他": "📌",
 }
 DEFAULT_EMOJI = "📌"
 
@@ -56,9 +56,11 @@ def _exclude_types() -> set:
 
 
 # ---- 查 Notion 事件 ----
-def query_events(start: datetime.date, end: datetime.date) -> list[dict]:
+def query_events(start: datetime.date, end: datetime.date,
+                 extra_exclude: set | None = None) -> list[dict]:
     """查「關鍵日期」落在 [start, end](含兩端)的事件,依日期排序。
-    回傳 [{'start','end','type','title','url','status'}]。"""
+    回傳 [{'start','end','type','title','url','status'}]。
+    extra_exclude:除了全域 NOTIFY_EXCLUDE_TYPES 外,額外要濾掉的事件類型。"""
     payload = {
         "filter": {
             "and": [
@@ -70,7 +72,7 @@ def query_events(start: datetime.date, end: datetime.date) -> list[dict]:
         "page_size": 100,
     }
     data = nt._post(f"/data_sources/{nt.TIMELINE_DS}/query", payload)
-    exclude = _exclude_types()
+    exclude = _exclude_types() | (extra_exclude or set())
     events: list[dict] = []
     for pg in data.get("results", []):
         p = pg.get("properties", {})
@@ -166,7 +168,8 @@ def notify_daily(dry_run: bool = False) -> str | None:
 
 def notify_tomorrow(dry_run: bool = False) -> str | None:
     tomorrow = datetime.datetime.now(TW_TZ).date() + datetime.timedelta(days=1)
-    events = query_events(tomorrow, tomorrow)
+    # 「每日關注」盯盤筆記只在當天 07:00 推,不在前一晚 21:00 重複
+    events = query_events(tomorrow, tomorrow, extra_exclude={"每日關注"})
     if not events:
         logger.info("明日(%s)無事件,不推播。", tomorrow)
         return None
@@ -182,7 +185,8 @@ def notify_weekly(dry_run: bool = False) -> str | None:
     # 下週一 = 今天之後最近的週一;下週日 = 下週一 + 6
     next_mon = today + datetime.timedelta(days=(7 - today.weekday()))
     next_sun = next_mon + datetime.timedelta(days=6)
-    events = query_events(next_mon, next_sun)
+    # 週報只放真實行事曆事件,不含每日盯盤筆記
+    events = query_events(next_mon, next_sun, extra_exclude={"每日關注"})
     msg = format_weekly(events, next_mon, next_sun)
     if dry_run:
         return msg

@@ -387,6 +387,7 @@ GUIDANCE = (
     "📎 也可以只貼連結,我會自動抓全文整理。\n"
     "🔍 想查資料庫?用「查」開頭,例如:查 光聖最近的時程\n"
     "🗓️ 記時程?用「時程」開頭,例如:時程 8131福懋科 8月量產\n"
+    "👀 隔日盯盤?用「關注」開頭,例如:關注 2330 台積電 站上季線再追\n"
     "🛠️ 想更正?「主表」改概念股主表、「改」改某筆新聞、「改股 8111:6442 光聖」一次改遍所有分頁\n"
     "📖 打「說明」看完整指令總表"
 )
@@ -396,6 +397,19 @@ _QUERY_PREFIXES = ["查詢", "查", "問", "搜尋"]
 
 # 時程事件的觸發前綴(訊息開頭出現就寫進 Notion 時間軸,而非 Google Sheet)
 _TIMELINE_PREFIXES = ["時程", "事件", "行事曆"]
+
+# 隔日盯盤筆記的觸發前綴(寫進 Notion,事件類型「每日關注」,隔天 07:00 隨推播帶出)
+_WATCHLIST_PREFIXES = ["關注"]
+_WATCHLIST_TYPE = "每日關注"
+_WATCHLIST_USAGE = (
+    "👀 關注用法:「關注」開頭,列出隔天想盯的股票(可多行,一行一檔),"
+    "隔天早上 07:00 會隨推播通知一次。\n"
+    "例如:\n"
+    "關注\n"
+    "2330 台積電 站上季線再追\n"
+    "3661 世芯 觀察缺口\n"
+    "(想指定今天請用「關注 今天 ...」;預設是隔天)"
+)
 
 # 「說明」指令:整段訊息完全等於這些字才觸發(避免新聞內文誤中)
 _HELP_WORDS = {"說明", "help", "指令", "幫助", "用法", "選單", "menu", "?", "？"}
@@ -416,6 +430,10 @@ _HELP_TEXT = (
     "• 時程 8131福懋科 8月量產\n"
     "• 時程 2330 7/17 法說會\n"
     "• 時程 3583 擴廠 8月試產、11月量產\n"
+    "\n"
+    "━━ 隔日盯盤 ━━(「關注」開頭,隔天 07:00 隨推播通知)\n"
+    "• 關注 2330 台積電 站上季線再追\n"
+    "• 多檔:「關注」換行後一行一檔\n"
     "\n"
     "━━ 改錯:股號打錯 ━━\n"
     "• 改股 1514:1815 富喬 → 所有分頁一次改\n"
@@ -686,6 +704,11 @@ def route_and_store(text: str) -> Result:
     if timeline is not None:
         return timeline
 
+    # 「關注」開頭 → 隔日盯盤筆記,寫進 Notion(隔天 07:00 隨推播帶出)
+    watchlist = _handle_watchlist(text)
+    if watchlist is not None:
+        return watchlist
+
     cfg, content = detect_category(text)
     if cfg is None:
         raise NoCategoryError(GUIDANCE)
@@ -905,6 +928,83 @@ def _handle_timeline(text: str):
     if result.get("url"):
         reply += f"\n{result['url']}"
     return Result(label="時程", reply=reply)
+
+
+# 關注筆記的日期覆寫詞:詞 → (相對天數)
+_WATCHLIST_DAY_WORDS = {"今天": 0, "今日": 0, "明天": 1, "明日": 1}
+
+
+def _handle_watchlist(text: str):
+    """開頭是「關注」→ 把每一行當一筆盯盤筆記寫進 Notion(事件類型「每日關注」),
+    預設日期為隔天,隔天 07:00 會隨群組推播帶出;否則回傳 None。"""
+    s = text.strip()
+    lines = [ln.strip() for ln in s.splitlines()]
+    first_line = lines[0] if lines else ""
+    matched = next((p for p in _WATCHLIST_PREFIXES if first_line.startswith(p)), None)
+    if matched is None:
+        return None
+
+    if not notion_timeline.enabled():
+        raise NoCategoryError(
+            "⚠️ 關注功能尚未啟用:請先在環境變數設定 NOTION_TOKEN。"
+        )
+
+    # 第一行關鍵字後面剩下的文字(可能是第一筆,也可能只是日期詞)
+    rest = first_line[len(matched):].strip(" :：、,，.。\n")
+
+    # 日期覆寫:開頭若是 今天/今日/明天/明日,吃掉該詞;預設隔天
+    offset = 1
+    label_day = "明日"
+    for word, off in _WATCHLIST_DAY_WORDS.items():
+        if rest.startswith(word):
+            offset = off
+            label_day = "今日" if off == 0 else "明日"
+            rest = rest[len(word):].strip(" :：、,，.。\n")
+            break
+
+    # 收集項目:第一行剩餘內容(若有)+ 後續每一非空行
+    items = [rest] if rest else []
+    items += [ln for ln in lines[1:] if ln]
+    if not items:
+        raise NoCategoryError(_WATCHLIST_USAGE)
+
+    target = datetime.datetime.now(notion_timeline.TW_TZ).date() + datetime.timedelta(days=offset)
+    date_iso = target.isoformat()
+
+    added = []
+    for item in items:
+        # 盡量關聯個股(用代號優先);關聯不到就只記事件、不自動新增個股(避免主表被盯盤筆記灌爆)
+        stock = None
+        try:
+            stock = notion_timeline.find_stock_page("", item)
+        except notion_timeline.NotionError as e:
+            logger.warning("關注:查個股頁失敗:%s", e)
+        try:
+            notion_timeline.add_event(
+                title=item[:200],
+                date_start=date_iso,
+                event_type=_WATCHLIST_TYPE,
+                stock_page_id=stock["id"] if stock else "",
+                concept_ids=stock.get("concept_ids") if stock else None,
+                source="LINE",
+                status="預定",
+            )
+            added.append((item, bool(stock)))
+        except notion_timeline.NotionError as e:
+            logger.warning("關注:寫入失敗(%s):%s", item, e)
+            added.append((item + "  ⚠️寫入失敗", False))
+
+    m, d = target.month, target.day
+    ok = [a for a in added if not a[0].endswith("寫入失敗")]
+    body = "\n".join(
+        f"• {name} {'🔗' if linked else ''}".rstrip() for name, linked in added
+    )
+    reply = (
+        f"👀 已加入{label_day}({m}/{d})關注,{label_day}早上 07:00 會隨推播通知一次:\n"
+        f"{body}\n"
+        f"(共 {len(ok)} 筆)"
+    )
+    return Result(label="關注", reply=reply)
 
 
 def _gather_corpus() -> str:
