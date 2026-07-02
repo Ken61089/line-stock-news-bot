@@ -167,8 +167,9 @@ def add_event(
     note: str = "",
     source: str = "LINE",
     status: str = "",
+    link: str = "",
 ) -> dict:
-    """建立一筆時程事件頁,回傳 {'url'}。"""
+    """建立一筆時程事件頁,回傳 {'url'}。link 會寫進「來源連結」。"""
     if event_type not in EVENT_TYPES:
         event_type = "其他"
     if not status:
@@ -191,6 +192,8 @@ def add_event(
         props["🔗 關聯個股"] = {"relation": [{"id": stock_page_id}]}
     if concept_ids:
         props["🔗 概念族群"] = {"relation": [{"id": cid} for cid in concept_ids]}
+    if link:
+        props["來源連結"] = {"url": link}
 
     data = _post(
         "/pages",

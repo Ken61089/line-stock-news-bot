@@ -1,7 +1,9 @@
 """
 公開資訊自動抓取 → 寫進 Notion 時程庫。
 
-目前來源:富聯網(money-link)國內法說會時間表(靜態頁,big5)。
+來源(合併去重):
+  1. 富聯網(money-link)國內法說會時間表(靜態頁,big5,最全,含地點/說明)
+  2. TDCC 集保 IR 平台法說會列表(補 money-link 漏的,附法說會簡報 PDF)
 只抓「Notion 個股主表裡追蹤的股票」、未來日期、含所有出席(自辦法說會 +
 出席券商論壇/座談會),寫成時程庫「法說會」事件,並依 (個股, 日期) 去重。
 
@@ -19,6 +21,7 @@ import notion_timeline as nt
 logger = logging.getLogger("line-news-bot.fetchers")
 
 MONEY_LINK_URL = "https://www.money-link.com.tw/stxba/imwcontent0.asp?page=INVC1&ID=INVC1"
+TDCC_URL = "https://irplatform.tdcc.com.tw/ir/zh/event/list"
 TW_TZ = nt.TW_TZ
 
 # 解析 money-link 每一列法說會(日期西元年在 class='bc',代號在 listcode)
@@ -32,13 +35,22 @@ _ROW_RE = re.compile(
     re.S,
 )
 
+# 解析 TDCC IR 平台每個 active-box(代號/名稱、日期時間、類型、選配簡報 PDF)
+_TDCC_RE = re.compile(
+    r"<h3>(\d+)\s+([^<]+)</h3>\s*"
+    r"<time>(\d{4})/(\d{2})/(\d{2})\s+([\d:]+)</time>\s*"
+    r"<span class=\"meeting[^\"]*\">([^<]+)</span>"
+    r"(?:\s*<a[^>]*href=\"([^\"]+)\")?",
+    re.S,
+)
+
 
 _EARNINGS_TYPE = "法說會"
 _HORIZON_DAYS = 120  # 只抓未來 120 天內的法說會
 
 
-def fetch_earnings_rows() -> list[dict]:
-    """抓 money-link 法說會表,回傳 [{date(YYYY-MM-DD), code, name, time, place, message}]。"""
+def fetch_moneylink_rows() -> list[dict]:
+    """抓 money-link 法說會表,回傳 [{date, code, name, time, place, message, link}]。"""
     r = httpx.get(MONEY_LINK_URL, timeout=30)
     r.raise_for_status()
     html = r.content.decode("big5", errors="ignore")
@@ -52,8 +64,53 @@ def fetch_earnings_rows() -> list[dict]:
             "time": tm.strip(),
             "place": place.strip(),
             "message": msg.strip(),
+            "link": "",
         })
     return rows
+
+
+def fetch_tdcc_rows() -> list[dict]:
+    """抓 TDCC IR 平台法說會列表(只取法說會類),回傳同 money-link 的欄位格式。"""
+    r = httpx.get(TDCC_URL, timeout=30, follow_redirects=True)
+    r.raise_for_status()
+    rows = []
+    for m in _TDCC_RE.finditer(r.text):
+        code, name, y, mo, d, tm, mtype, pdf = m.groups()
+        if "法說" not in mtype and "法人說明" not in mtype:
+            continue  # 只要法說會,略過其他活動
+        rows.append({
+            "date": f"{y}-{mo}-{d}",
+            "code": code.strip(),
+            "name": re.sub(r"\s+", "", name).strip(),
+            "time": tm.strip(),
+            "place": "",
+            "message": mtype.strip(),
+            "link": (pdf or "").strip(),
+        })
+    return rows
+
+
+def fetch_earnings_rows() -> list[dict]:
+    """合併 money-link + TDCC,依 (代號, 日期) 去重。money-link 優先(欄位較全),
+    但缺簡報連結時用 TDCC 的補上;TDCC 獨有的(money-link 沒列)也一併納入。"""
+    merged: dict[tuple, dict] = {}
+    for row in _safe_fetch(fetch_moneylink_rows, "money-link") + _safe_fetch(fetch_tdcc_rows, "TDCC"):
+        key = (row["code"], row["date"])
+        if key not in merged:
+            merged[key] = row
+        else:
+            # 已有(通常是 money-link):只補空的簡報連結
+            if not merged[key].get("link") and row.get("link"):
+                merged[key]["link"] = row["link"]
+    return list(merged.values())
+
+
+def _safe_fetch(fn, label: str) -> list[dict]:
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("抓取 %s 失敗(略過此來源):%s", label, e)
+        return []
 
 
 def _existing_earnings(since: datetime.date) -> set:
@@ -123,6 +180,7 @@ def sync_earnings_calls(dry_run: bool = False) -> dict:
                 note=note,
                 source="自動抓取",
                 status="預定",
+                link=r.get("link", ""),
             )
             existing.add((stock["id"], r["date"]))  # 同批內也去重
             added += 1
