@@ -129,9 +129,12 @@ def callback():
             _say(reply_token, user_id, "\n".join(lines))
             continue
 
-        # 白名單檢查
+        # 群組/聊天室:現階段只當推播目的地,不回應任何人的發言(避免洗版)
+        if group_id or room_id:
+            continue
+
+        # 白名單檢查(1 對 1):非本人 → 靜默忽略,不回訊息
         if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
-            _say(reply_token, user_id, "⛔ 抱歉,這是私人機器人。")
             continue
 
         # 解析+寫入會等網路,放背景執行緒,Webhook 先快速回 200 給 LINE
