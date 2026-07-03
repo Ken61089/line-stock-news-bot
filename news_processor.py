@@ -462,6 +462,26 @@ def _is_help(text: str) -> bool:
     return text.strip().lower() in _HELP_WORDS
 
 
+def is_group_additive_command(text: str) -> bool:
+    """群組成員可用的「新增/查詢類」指令才回 True(時程/關注/更新法說會/存新聞/查詢/說明);
+    破壞性操作(改股、主表修正、刪除)與一般聊天回 False,群組不處理。"""
+    s = (text or "").strip()
+    if not s:
+        return False
+    if s.lower() in _HELP_WORDS:
+        return True
+    first = s.splitlines()[0].strip()
+    additive_prefixes = (
+        tuple(_TIMELINE_PREFIXES) + tuple(_WATCHLIST_PREFIXES)
+        + tuple(_FETCH_EARNINGS_PREFIXES) + tuple(_QUERY_PREFIXES)
+    )
+    if first.startswith(additive_prefixes):
+        return True
+    # 存新聞:第一行是分類關鍵字(個股新聞/產業新聞/…)
+    cfg, _ = detect_category(text)
+    return cfg is not None
+
+
 class NoCategoryError(Exception):
     """第一行沒有可辨識的分類關鍵字,或關鍵字後沒有內容。"""
 

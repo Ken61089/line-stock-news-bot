@@ -25,7 +25,7 @@ from linebot.v3.messaging import (
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
-from news_processor import route_and_store, NoCategoryError
+from news_processor import route_and_store, NoCategoryError, is_group_additive_command
 import calendar_notify
 
 logging.basicConfig(
@@ -91,7 +91,7 @@ def _process_and_reply(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-07-03-earnings-preview"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-07-03-group-commands"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
@@ -132,8 +132,15 @@ def callback():
             _say(reply_token, user_id, "\n".join(lines))
             continue
 
-        # 群組/聊天室:現階段只當推播目的地,不回應任何人的發言(避免洗版)
+        # 群組/聊天室:團隊成員可下「新增/查詢類」指令(時程/關注/更新法說會/存新聞/查詢),
+        # 一般聊天與破壞性指令(改股/主表修正)一律忽略,避免洗版與誤改。
         if group_id or room_id:
+            if is_group_additive_command(text):
+                threading.Thread(
+                    target=_process_and_reply,
+                    args=(reply_token, user_id, text),
+                    daemon=True,
+                ).start()
             continue
 
         # 白名單檢查(1 對 1):非本人 → 靜默忽略,不回訊息
