@@ -560,12 +560,12 @@ QUERY_ENABLED = os.environ.get("ENABLE_QUERY", "0") == "1"
 # 時程事件的觸發前綴(訊息開頭出現就寫進 Notion 時間軸,而非 Google Sheet)
 _TIMELINE_PREFIXES = ["時程", "事件", "行事曆"]
 
-# 隔日盯盤筆記的觸發前綴(寫進 Notion,事件類型「每日關注」,隔天 07:00 隨推播帶出)
+# 隔日盯盤筆記的觸發前綴(寫進 Notion,事件類型「每日關注」,隔天 08:30 隨推播帶出)
 _WATCHLIST_PREFIXES = ["關注"]
 _WATCHLIST_TYPE = "每日關注"
 _WATCHLIST_USAGE = (
     "👀 關注用法:「關注」開頭,列出隔天想盯的股票(可多行,一行一檔),"
-    "隔天早上 07:00 會隨推播通知一次。\n"
+    "隔天早上 08:30 會隨推播通知一次。\n"
     "例如:\n"
     "關注\n"
     "2330 台積電 站上季線再追\n"
@@ -589,6 +589,12 @@ _HELP_WORDS = {"說明", "help", "指令", "幫助", "用法", "選單", "menu",
 _HELP_TEXT = (
     "📖 機器人指令總覽\n"
     "\n"
+    "━━ 自動推播時間(台灣) ━━\n"
+    "• 每天 08:30 今日行事曆＋法說會倒數(前3天)\n"
+    "• 每天 21:00 明日事件＋今日隨筆彙整\n"
+    "• 週日 21:00 下週行事曆\n"
+    "(每天 06:20/06:30 自動抓美國經濟事件、法說會)\n"
+    "\n"
     "━━ 存新聞 ━━\n"
     "第一行打分類,第二行貼內容或連結:\n"
     "• 個股新聞  • 產業新聞  • 產業報告\n"
@@ -600,13 +606,17 @@ _HELP_TEXT = (
     "• 時程 2330 7/17 法說會\n"
     "• 時程 3583 擴廠 8月試產、11月量產\n"
     "\n"
-    "━━ 隔日盯盤 ━━(「關注」開頭,隔天 07:00 隨推播通知)\n"
+    "━━ 隔日盯盤 ━━(「關注」開頭,隔天 08:30 隨推播通知)\n"
     "• 關注 2330 台積電 站上季線再追\n"
     "• 多檔:「關注」換行後一行一檔\n"
     "\n"
     "━━ 隨手筆記 ━━(隨時記,當天 21:00 隨推播彙整)\n"
     "• 隨筆 台積電CoWoS產能吃緊,留意設備股\n"
     "• 打「今日隨筆」叫出今天已記的(依時間排序)\n"
+    "\n"
+    "━━ 查行事曆 ━━(唯讀,列出某段期間的事件)\n"
+    "• 本週 / 下週\n"
+    "• 列出 7/10(某天)  • 列出 7/10~7/15(範圍)\n"
     "\n"
     "━━ 法說會自動更新 ━━(每天自動抓,也可手動)\n"
     "• 打「更新法說會」→ 立即抓追蹤股的法說會進時程\n"
@@ -809,7 +819,7 @@ def route_and_store(text: str) -> Result:
     if timeline is not None:
         return timeline
 
-    # 「關注」開頭 → 隔日盯盤筆記,寫進 Notion(隔天 07:00 隨推播帶出)
+    # 「關注」開頭 → 隔日盯盤筆記,寫進 Notion(隔天 08:30 隨推播帶出)
     watchlist = _handle_watchlist(text)
     if watchlist is not None:
         return watchlist
@@ -1070,7 +1080,7 @@ _WATCHLIST_DAY_WORDS = {"今天": 0, "今日": 0, "明天": 1, "明日": 1}
 
 def _handle_watchlist(text: str):
     """開頭是「關注」→ 把每一行當一筆盯盤筆記寫進 Notion(事件類型「每日關注」),
-    預設日期為隔天,隔天 07:00 會隨群組推播帶出;否則回傳 None。"""
+    預設日期為隔天,隔天 08:30 會隨群組推播帶出;否則回傳 None。"""
     s = text.strip()
     lines = [ln.strip() for ln in s.splitlines()]
     first_line = lines[0] if lines else ""
@@ -1142,7 +1152,7 @@ def _handle_watchlist(text: str):
     )
     tail = f"(共 {len(ok)} 筆" + (f",已覆蓋前一版 {replaced} 筆)" if replaced else ")")
     reply = (
-        f"👀 已更新{label_day}({m}/{d})關注,{label_day}早上 07:00 會隨推播通知一次:\n"
+        f"👀 已更新{label_day}({m}/{d})關注,{label_day}早上 08:30 會隨推播通知一次:\n"
         f"{body}\n"
         f"{tail}"
     )
