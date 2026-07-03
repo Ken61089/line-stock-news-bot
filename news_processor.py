@@ -394,6 +394,8 @@ GUIDANCE = (
 
 # 查詢模式的觸發前綴(訊息開頭出現就進查詢,而非寫入)
 _QUERY_PREFIXES = ["查詢", "查", "問", "搜尋"]
+# 查詢功能開關:資料庫完善前先停用。要恢復就在環境變數設 ENABLE_QUERY=1
+QUERY_ENABLED = os.environ.get("ENABLE_QUERY", "0") == "1"
 
 # 時程事件的觸發前綴(訊息開頭出現就寫進 Notion 時間軸,而非 Google Sheet)
 _TIMELINE_PREFIXES = ["時程", "事件", "行事曆"]
@@ -422,10 +424,6 @@ _HELP_TEXT = (
     "• 個股新聞  • 產業新聞  • 產業報告\n"
     "• 全球局勢  • 知識(或筆記)\n"
     "(只貼連結我會自動抓全文)\n"
-    "\n"
-    "━━ 查詢 ━━(「查」或「問」開頭)\n"
-    "• 查 CPO有哪些股\n"
-    "• 查 光聖屬於哪些概念\n"
     "\n"
     "━━ 記時程 ━━(「時程」開頭,寫進 Notion 時間軸)\n"
     "• 時程 8131福懋科 8月量產\n"
@@ -473,8 +471,10 @@ def is_group_additive_command(text: str) -> bool:
     first = s.splitlines()[0].strip()
     additive_prefixes = (
         tuple(_TIMELINE_PREFIXES) + tuple(_WATCHLIST_PREFIXES)
-        + tuple(_FETCH_EARNINGS_PREFIXES) + tuple(_QUERY_PREFIXES)
+        + tuple(_FETCH_EARNINGS_PREFIXES)
     )
+    if QUERY_ENABLED:
+        additive_prefixes += tuple(_QUERY_PREFIXES)
     if first.startswith(additive_prefixes):
         return True
     # 存新聞:第一行是分類關鍵字(個股新聞/產業新聞/…)
@@ -712,6 +712,8 @@ def route_and_store(text: str) -> Result:
     # 先看是不是「查詢」(用「查」「問」等開頭),是的話走查詢、不寫入
     question = _detect_query(text)
     if question is not None:
+        if not QUERY_ENABLED:
+            return Result("查詢(暫停)", "🔍 查詢功能整理中、暫停使用(資料庫完善後會再開放)。")
         if not question:
             raise NoCategoryError(
                 "🔍 查詢用法:在「查」後面接你的問題。\n例如:\n查 光聖最近有什麼時程\n查 這週的全球局勢重點"

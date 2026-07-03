@@ -91,7 +91,7 @@ def _process_and_reply(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-07-03-group-commands"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-07-03-query-off"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
