@@ -31,6 +31,12 @@ FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "").strip()
 FIRECRAWL_BASE_URL = os.environ.get("FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/")
 _ECON_TYPE = "經濟數據"
 _ECON_HORIZON_DAYS = 45
+# 把 MacroMicro 行事曆「區域」下拉選成美國(option value=us),觸發只顯示美國事件
+_MM_SELECT_US_JS = (
+    "document.querySelectorAll('select').forEach(function(s){"
+    "if(Array.prototype.some.call(s.options,function(o){return o.value==='us';}))"
+    "{s.value='us';s.dispatchEvent(new Event('change',{bubbles:true}));}});"
+)
 _MM_MONTH_RE = re.compile(r"####\s*(\d{4})\s*年\s*(\d{1,2})\s*月")
 _MM_DAY_RE = re.compile(r"\*\*(\d{1,2})(?:[（(]週.[)）])?\*\*")
 _MM_EVENT_RE = re.compile(r"\[([^\]]+?)\]\((https://www\.macromicro\.me/[^)]+)\)")
@@ -216,8 +222,19 @@ def fetch_macromicro_md() -> str:
     r = httpx.post(
         f"{FIRECRAWL_BASE_URL}/v2/scrape",
         headers={"Authorization": f"Bearer {FIRECRAWL_API_KEY}"},
-        json={"url": MACROMICRO_URL, "formats": ["markdown"], "waitFor": 6000},
-        timeout=90,
+        # location=台灣 → MacroMicro 直接渲染成台灣時間/日期(不必自己換時區,和使用者看到的一致);
+        # 用 JS 把「區域」下拉選成美國(option value=us)→ 只留美國事件,不被亞洲事件擠掉摺疊區。
+        json={
+            "url": MACROMICRO_URL,
+            "formats": ["markdown"],
+            "waitFor": 5000,
+            "location": {"country": "TW", "languages": ["zh-TW"]},
+            "actions": [
+                {"type": "executeJavascript", "script": _MM_SELECT_US_JS},
+                {"type": "wait", "milliseconds": 5000},
+            ],
+        },
+        timeout=120,
     )
     r.raise_for_status()
     md = ((r.json().get("data") or {}).get("markdown") or "").strip()
@@ -306,7 +323,7 @@ def sync_econ_events(dry_run: bool = False) -> dict:
         if (r["name"], r["date"]) in existing:
             skipped += 1
             continue
-        items.append(f"{r['date']} {r['name']}" + (f"（美東 {r['time']}）" if r["time"] else ""))
+        items.append(f"{r['date']} {r['name']}" + (f"（{r['time']}）" if r["time"] else ""))
         if dry_run:
             added += 1
             continue
@@ -315,7 +332,7 @@ def sync_econ_events(dry_run: bool = False) -> dict:
                 title=r["name"],
                 date_start=r["date"],
                 event_type=_ECON_TYPE,
-                note=(f"美東時間 {r['time']}" if r["time"] else ""),
+                note=(f"台灣時間 {r['time']}" if r["time"] else ""),
                 source="自動抓取",
                 status="預定",
                 link=r["url"],
