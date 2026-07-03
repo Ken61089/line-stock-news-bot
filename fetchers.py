@@ -10,6 +10,7 @@
 由 calendar_notify 的排程每日觸發;也可用 LINE 指令「更新法說會」手動觸發。
 """
 
+import os
 import re
 import logging
 import datetime
@@ -23,6 +24,16 @@ logger = logging.getLogger("line-news-bot.fetchers")
 MONEY_LINK_URL = "https://www.money-link.com.tw/stxba/imwcontent0.asp?page=INVC1&ID=INVC1"
 TDCC_URL = "https://irplatform.tdcc.com.tw/ir/zh/event/list"
 TW_TZ = nt.TW_TZ
+
+# MacroMicro 全球財經行事曆(有 Cloudflare 防爬 → 必須經 Firecrawl 抓,不能純 httpx)
+MACROMICRO_URL = "https://www.macromicro.me/calendar"
+FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+FIRECRAWL_BASE_URL = os.environ.get("FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/")
+_ECON_TYPE = "經濟數據"
+_ECON_HORIZON_DAYS = 45
+_MM_MONTH_RE = re.compile(r"####\s*(\d{4})\s*年\s*(\d{1,2})\s*月")
+_MM_DAY_RE = re.compile(r"\*\*(\d{1,2})(?:[（(]週.[)）])?\*\*")
+_MM_EVENT_RE = re.compile(r"\[([^\]]+?)\]\((https://www\.macromicro\.me/[^)]+)\)")
 
 # 解析 money-link 每一列法說會(日期西元年在 class='bc',代號在 listcode)
 _ROW_RE = re.compile(
@@ -189,6 +200,133 @@ def sync_earnings_calls(dry_run: bool = False) -> dict:
 
     logger.info("法說會同步:比對到 %d 筆追蹤股,新增 %d,略過(已存在)%d", matched, added, skipped)
     return {"matched": matched, "added": added, "skipped": skipped, "added_items": added_items}
+
+
+# ==========================================================
+# MacroMicro 美國經濟事件(經 Firecrawl 抓,繞過 Cloudflare)
+# ==========================================================
+def econ_enabled() -> bool:
+    return bool(FIRECRAWL_API_KEY)
+
+
+def fetch_macromicro_md() -> str:
+    """經 Firecrawl 抓 MacroMicro 行事曆,回傳 markdown(MacroMicro 有 Cloudflare,純 httpx 會 403)。"""
+    if not FIRECRAWL_API_KEY:
+        raise RuntimeError("未設定 FIRECRAWL_API_KEY,無法抓 MacroMicro(Cloudflare 需 Firecrawl)")
+    r = httpx.post(
+        f"{FIRECRAWL_BASE_URL}/v2/scrape",
+        headers={"Authorization": f"Bearer {FIRECRAWL_API_KEY}"},
+        json={"url": MACROMICRO_URL, "formats": ["markdown"], "waitFor": 6000},
+        timeout=90,
+    )
+    r.raise_for_status()
+    md = ((r.json().get("data") or {}).get("markdown") or "").strip()
+    if not md:
+        raise RuntimeError("Firecrawl 回傳空內容")
+    return md
+
+
+def parse_macromicro_us(md: str) -> list[dict]:
+    """從 MacroMicro 月曆 markdown 解析「美國」經濟事件,回傳 [{date, name, time, url}]。
+    處理月曆邊界(上月尾日/下月頭日)與跨月;只留名稱含「美國」或連結含 /us- 的事件。"""
+    mm = _MM_MONTH_RE.search(md)
+    if not mm:
+        return []
+    year, month = int(mm.group(1)), int(mm.group(2))
+    tokens = [(m.start(), "day", int(m.group(1))) for m in _MM_DAY_RE.finditer(md)]
+    tokens += [(m.start(), "event", (m.group(1), m.group(2))) for m in _MM_EVENT_RE.finditer(md)]
+    tokens.sort(key=lambda x: x[0])
+    day_nums = [t[2] for t in tokens if t[1] == "day"]
+    if not day_nums:
+        return []
+    cm, cy = month, year
+    if day_nums[0] > 20:  # 月曆先顯示上月尾幾天 → 起始月往前一個月
+        cm, cy = (12, cy - 1) if cm == 1 else (cm - 1, cy)
+
+    out, cur, last = [], None, 0
+    for _pos, kind, val in tokens:
+        if kind == "day":
+            d = val
+            if d < last:  # 日期倒退 → 跨到下個月
+                cm, cy = (1, cy + 1) if cm == 12 else (cm + 1, cy)
+            last = d
+            try:
+                cur = datetime.date(cy, cm, d)
+            except ValueError:
+                cur = None
+        elif cur is not None:
+            name_raw, url = val
+            clean = re.sub(r"\s+", " ", re.sub(r"\\+", " ", name_raw)).strip()
+            tmatch = re.search(r"(\d{1,2}:\d{2})\s*$", clean)
+            time_s = tmatch.group(1) if tmatch else ""
+            name = clean[:tmatch.start()].strip() if tmatch else clean
+            if ("美國" in name) or ("/us-" in url):
+                out.append({"date": cur.isoformat(), "name": name, "time": time_s, "url": url})
+    return out
+
+
+def _existing_econ(since: datetime.date) -> set:
+    """時程庫既有的「經濟數據」事件(關鍵日期 >= since),回傳 {(標題, 日期)} 供去重。"""
+    existing = set()
+    cursor = None
+    while True:
+        payload = {
+            "filter": {"and": [
+                {"property": "事件類型", "select": {"equals": _ECON_TYPE}},
+                {"property": "關鍵日期", "date": {"on_or_after": since.isoformat()}},
+            ]},
+            "page_size": 100,
+        }
+        if cursor:
+            payload["start_cursor"] = cursor
+        data = nt._post(f"/data_sources/{nt.TIMELINE_DS}/query", payload)
+        for pg in data.get("results", []):
+            props = pg.get("properties", {})
+            title = "".join(t.get("plain_text", "") for t in props.get("Name", {}).get("title", [])).strip()
+            date = ((props.get("關鍵日期", {}).get("date") or {}).get("start") or "")[:10]
+            existing.add((title, date))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return existing
+
+
+def sync_econ_events(dry_run: bool = False) -> dict:
+    """抓 MacroMicro → 只留「美國事件 + 未來(45天內)」→ 依(標題,日期)去重 → 寫進時程庫「經濟數據」。
+    回傳 {'found','added','skipped','added_items'}。"""
+    today = datetime.datetime.now(TW_TZ).date()
+    horizon = (today + datetime.timedelta(days=_ECON_HORIZON_DAYS)).isoformat()
+    today_iso = today.isoformat()
+
+    rows = [r for r in parse_macromicro_us(fetch_macromicro_md()) if today_iso <= r["date"] <= horizon]
+    existing = _existing_econ(today)
+
+    added, skipped, items = 0, 0, []
+    for r in rows:
+        if (r["name"], r["date"]) in existing:
+            skipped += 1
+            continue
+        items.append(f"{r['date']} {r['name']}" + (f"（美東 {r['time']}）" if r["time"] else ""))
+        if dry_run:
+            added += 1
+            continue
+        try:
+            nt.add_event(
+                title=r["name"],
+                date_start=r["date"],
+                event_type=_ECON_TYPE,
+                note=(f"美東時間 {r['time']}" if r["time"] else ""),
+                source="自動抓取",
+                status="預定",
+                link=r["url"],
+            )
+            existing.add((r["name"], r["date"]))
+            added += 1
+        except nt.NotionError as e:
+            logger.warning("寫入經濟數據失敗(%s %s):%s", r["name"], r["date"], e)
+
+    logger.info("經濟數據同步:美國事件 %d 筆(未來%d天),新增 %d,略過 %d", len(rows), _ECON_HORIZON_DAYS, added, skipped)
+    return {"found": len(rows), "added": added, "skipped": skipped, "added_items": items}
 
 
 if __name__ == "__main__":

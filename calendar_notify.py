@@ -41,7 +41,7 @@ TYPE_EMOJI = {
     "發行可轉債": "💵", "除權息": "💰", "增減資": "🔀", "營收公布": "📊",
     "財報公布": "📋", "財報利空/多": "⚠️", "擴廠進度": "🏭", "試產進度": "🧪",
     "量產進度": "🚀", "展覽/政策": "📰", "盤後隨筆": "📝", "每日關注": "👀",
-    "隨手筆記": "✏️", "其他": "📌",
+    "隨手筆記": "✏️", "經濟數據": "🏦", "其他": "📌",
 }
 DEFAULT_EMOJI = "📌"
 
@@ -375,6 +375,7 @@ def maybe_start_scheduler() -> None:
     w_h, w_m = _parse_hhmm(os.environ.get("NOTIFY_WEEKLY_TIME", "21:00"), 21, 0)
     w_dow = int(os.environ.get("NOTIFY_WEEKLY_DOW", "6"))  # 0=一…6=日
     f_h, f_m = _parse_hhmm(os.environ.get("FETCH_EARNINGS_TIME", "06:30"), 6, 30)
+    e_h, e_m = _parse_hhmm(os.environ.get("FETCH_ECON_TIME", "06:20"), 6, 20)
 
     sched = BackgroundScheduler(timezone=tz)
     sched.add_job(
@@ -398,6 +399,14 @@ def maybe_start_scheduler() -> None:
             id="fetch_earnings", replace_existing=True,
         )
         fetch_log = f"、每日 {f_h:02d}:{f_m:02d} 抓法說會"
+        # 每天 06:20 抓 MacroMicro 美國經濟事件(需 FIRECRAWL_API_KEY,沒設會自動略過)
+        if fetchers.econ_enabled():
+            sched.add_job(
+                _safe(fetchers.sync_econ_events),
+                CronTrigger(hour=e_h, minute=e_m, timezone=tz),
+                id="fetch_econ", replace_existing=True,
+            )
+            fetch_log += f"、每日 {e_h:02d}:{e_m:02d} 抓美國經濟事件"
     except Exception:  # noqa: BLE001
         logger.exception("fetchers 掛載失敗,法說會自動抓取不啟用")
         fetch_log = ""

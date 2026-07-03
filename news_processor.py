@@ -611,6 +611,9 @@ _HELP_TEXT = (
     "━━ 法說會自動更新 ━━(每天自動抓,也可手動)\n"
     "• 打「更新法說會」→ 立即抓追蹤股的法說會進時程\n"
     "\n"
+    "━━ 美國經濟事件 ━━(每天自動抓 MacroMicro,也可手動)\n"
+    "• 打「更新經濟」→ 立即抓美國經濟事件(CPI/FOMC…)進時程\n"
+    "\n"
     "━━ 改錯:股號打錯 ━━\n"
     "• 改股 1514:1815 富喬 → 所有分頁一次改\n"
     "• 主表 改股 1514:1815 富喬 → 只改主表\n"
@@ -648,6 +651,7 @@ def is_group_additive_command(text: str) -> bool:
     additive_prefixes = (
         tuple(_TIMELINE_PREFIXES) + tuple(_WATCHLIST_PREFIXES)
         + tuple(_NOTE_PREFIXES) + tuple(_FETCH_EARNINGS_PREFIXES)
+        + tuple(_FETCH_ECON_PREFIXES)
     )
     if QUERY_ENABLED:
         additive_prefixes += tuple(_QUERY_PREFIXES)
@@ -824,6 +828,11 @@ def route_and_store(text: str) -> Result:
     fetched = _handle_fetch_earnings(text)
     if fetched is not None:
         return fetched
+
+    # 「更新經濟/抓經濟」→ 立即經 Firecrawl 抓 MacroMicro 美國經濟事件
+    econ = _handle_fetch_econ(text)
+    if econ is not None:
+        return econ
 
     cfg, content = detect_category(text)
     if cfg is None:
@@ -1216,6 +1225,32 @@ def _handle_fetch_earnings(text: str):
     elif res["added"] == 0:
         lines.append("(追蹤股近期法說會都已在時程庫,無新增)")
     return Result(label="法說會更新", reply="\n".join(lines))
+
+
+_FETCH_ECON_PREFIXES = ("更新經濟", "抓經濟", "更新經濟數據", "經濟數據更新")
+
+
+def _handle_fetch_econ(text: str):
+    """開頭是「更新經濟/抓經濟」→ 立即經 Firecrawl 抓 MacroMicro 美國經濟事件寫進時程庫;否則 None。"""
+    first = text.strip().splitlines()[0].strip() if text.strip() else ""
+    if not any(first.startswith(p) for p in _FETCH_ECON_PREFIXES):
+        return None
+    if not notion_timeline.enabled():
+        raise NoCategoryError("⚠️ 尚未啟用:請先設定 NOTION_TOKEN。")
+    import fetchers
+    if not fetchers.econ_enabled():
+        raise NoCategoryError("⚠️ 美國經濟事件功能未啟用:請先在環境變數設定 FIRECRAWL_API_KEY。")
+    res = fetchers.sync_econ_events()
+    lines = [
+        "🏦 美國經濟事件更新完成(來源:MacroMicro)",
+        f"抓到未來美國事件 {res['found']} 筆 → 新增 {res['added']}、已存在略過 {res['skipped']}",
+    ]
+    if res["added_items"]:
+        lines.append("")
+        lines += [f"• {it}" for it in res["added_items"][:20]]
+    elif res["added"] == 0:
+        lines.append("(近期美國經濟事件都已在時程庫,無新增)")
+    return Result(label="經濟數據更新", reply="\n".join(lines))
 
 
 def _gather_corpus() -> str:
