@@ -14,8 +14,6 @@ import datetime
 from dataclasses import dataclass
 from typing import List, Type, Callable
 
-import gspread
-from google.oauth2.service_account import Credentials
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError, model_validator
 
@@ -29,19 +27,10 @@ AI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://hnd1.aihub.zeabur.ai/v1
 AI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-5")
 
-GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
-GOOGLE_SHEET_TITLE = os.environ.get("GOOGLE_SHEET_TITLE", "股票投資大腦資料庫")
-
 # 送進 AI 分析的內文字數上限(抓到的全文可能很長)
 MAX_CONTENT_CHARS = int(os.environ.get("MAX_CONTENT_CHARS", "8000"))
 
-# 概念股主表分頁(個股 ↔ 概念族群,自動累積)
-CONCEPT_MASTER_TAB = os.environ.get("CONCEPT_MASTER_TAB", "概念股主表")
-
-# 概念題材標準清單分頁(白名單;AI 抽概念時優先對照,名稱統一)
-CONCEPT_LIST_TAB = os.environ.get("CONCEPT_LIST_TAB", "概念清單")
-
-# 種子清單:第一次會寫進「概念清單」分頁,之後你可在 Sheet 自行增刪(改完需重啟服務生效)
+# 概念題材種子清單:與 Notion 概念族群庫現有概念合併成 AI 標概念的白名單(見 _get_concept_whitelist)
 _CONCEPT_SEED = [
     # AI / 伺服器 / 算力
     "AI伺服器", "AI ASIC", "CoWoS", "先進封裝", "HBM", "ABF載板", "液冷散熱",
@@ -67,8 +56,6 @@ _CONCEPT_SEED = [
     # 傳產 / 其他
     "散熱", "散裝航運", "貨櫃航運", "鋼鐵", "資產題材", "金融",
 ]
-
-_whitelist_cache = None
 
 _URL_RE = re.compile(r"https?://\S+")
 
@@ -725,109 +712,13 @@ def _safe_json_loads(text: str) -> dict:
 
 
 # ==========================================================
-# Google Sheets
+# 小工具:清單字串切分
 # ==========================================================
-def _open_workbook():
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
-    if raw:
-        if not raw.startswith("{"):
-            import base64
-            raw = base64.b64decode(raw).decode("utf-8")
-        creds = Credentials.from_service_account_info(json.loads(raw), scopes=scopes)
-    else:
-        creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
-
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(GOOGLE_SHEET_ID) if GOOGLE_SHEET_ID else gc.open(GOOGLE_SHEET_TITLE)
-
-
-def _get_worksheet(tab_name: str, header: List[str]):
-    workbook = _open_workbook()
-
-    try:
-        worksheet = workbook.worksheet(tab_name)
-    except gspread.WorksheetNotFound:
-        worksheet = workbook.add_worksheet(title=tab_name, rows=1000, cols=max(len(header), 10))
-        worksheet.append_row(header)
-        return worksheet
-
-    # 確保標題列正確(新增欄位時會自動補上;只在結尾加欄不會弄亂既有資料)
-    if worksheet.row_values(1) != header:
-        worksheet.update(values=[header], range_name="A1")
-    return worksheet
-
-
-# ==========================================================
-# 概念股主表(概念導向:一列一個概念,右邊列出成分股,自動累積)
-# ==========================================================
-_CONCEPT_MASTER_HEADER = ["概念/題材", "成分股", "個股數", "首次出現", "最近出現"]
-_STOCK_CODE_RE = re.compile(r"\d{3,6}")
 _LIST_SPLIT_RE = re.compile(r"[,、,;；/]")
-
-
-def _stock_key(s: str) -> str:
-    """個股的去重鍵:優先用代號(台股 3-6 位數),否則用去空白小寫的名稱。"""
-    m = _STOCK_CODE_RE.search(s)
-    return m.group(0) if m else re.sub(r"\s+", "", s).lower()
 
 
 def _split_list(s: str) -> List[str]:
     return [t.strip() for t in _LIST_SPLIT_RE.split(s) if t.strip()]
-
-
-def _update_concept_master(pairs, now: str) -> str:
-    """把 [(個股, [概念...]), ...] 反轉成「概念 → 成分股」upsert 進主表;回傳更新摘要。"""
-    # 反轉:concept -> [個股顯示名](以代號去重、保序)
-    batch, order = {}, []
-    for stock, concepts in pairs or []:
-        stock = (stock or "").strip()
-        if not stock:
-            continue
-        for c in concepts or []:
-            c = (c or "").strip()
-            if not c:
-                continue
-            if c not in batch:
-                batch[c] = []
-                order.append(c)
-            if not any(_stock_key(stock) == _stock_key(x) for x in batch[c]):
-                batch[c].append(stock)
-    if not batch:
-        return ""
-
-    ws = _get_worksheet(CONCEPT_MASTER_TAB, _CONCEPT_MASTER_HEADER)
-    rows = ws.get_all_values()
-    existing = {}  # 概念 -> (列號1-based, 該列資料)
-    for i, r in enumerate(rows[1:], start=2):
-        if r and r[0].strip():
-            existing[r[0].strip()] = (i, r)
-
-    updates, appends, lines = [], [], []
-    for c in order:
-        new_stocks = batch[c]
-        if c in existing:
-            ridx, r = existing[c]
-            cur = _split_list(r[1]) if len(r) > 1 else []
-            added = [s for s in new_stocks if not any(_stock_key(s) == _stock_key(x) for x in cur)]
-            merged = cur + added
-            first = r[3] if (len(r) > 3 and r[3].strip()) else now
-            updates.append((f"A{ridx}:E{ridx}", [[c, ", ".join(merged), len(merged), first, now]]))
-            note = f"(新增:{', '.join(added)})" if added else "(無新增)"
-            lines.append(f"• {c}({len(merged)}檔):{', '.join(merged)} {note}")
-        else:
-            appends.append([c, ", ".join(new_stocks), len(new_stocks), now, now])
-            lines.append(f"• {c}({len(new_stocks)}檔):{', '.join(new_stocks)} (新概念)")
-
-    for rng, vals in updates:
-        ws.update(values=vals, range_name=rng, value_input_option="USER_ENTERED")
-    if appends:
-        ws.append_rows(appends, value_input_option="USER_ENTERED")
-
-    return "🏷️ 概念股主表已更新:\n" + "\n".join(lines)
 
 
 def _get_concept_whitelist() -> List[str]:
@@ -1319,15 +1210,6 @@ def _split_colon(s: str):
     return s[:idx].strip(), s[idx + 1:].strip()
 
 
-def _find_concept_row(rows, concept: str):
-    """在主表找概念列(不分大小寫);回傳 (列號1-based, 該列) 或 (None, None)。"""
-    target = concept.strip().casefold()
-    for i, r in enumerate(rows[1:], start=2):
-        if r and r[0].strip().casefold() == target:
-            return i, r
-    return None, None
-
-
 def _cfg_by_word(word: str):
     """把分類詞(產業報告/個股/…)對應到 CategoryConfig(依關鍵字由長到短)。"""
     w = word.strip()
@@ -1626,4 +1508,4 @@ https://example.com/news/6442"""
     result = route_and_store(demo)
     print(f"分類:{result.label}")
     print(result.reply)
-    print("✅ 已寫入 Google Sheet")
+    print("✅ 已寫入 Notion")
