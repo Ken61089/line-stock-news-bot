@@ -255,10 +255,12 @@ def _infer_status(date_start: str, date_end: str = "") -> str:
 # 概念族群:找/建概念頁、把概念掛到個股(取代舊 Google Sheet 概念股主表)
 # ==========================================================
 _concept_cache: dict = {}
+_concept_names_cache: list | None = None  # 概念名稱白名單快取(新建概念時失效)
 
 
 def find_or_create_concept(name: str) -> str:
     """在概念族群庫用名稱找概念頁,沒有就建立。回傳頁 id(找不到/建不出回 "")。"""
+    global _concept_names_cache
     name = (name or "").strip()
     if not name:
         return ""
@@ -280,9 +282,19 @@ def find_or_create_concept(name: str) -> str:
             },
         )
         cid = created.get("id", "")
+        _concept_names_cache = None  # 新建了概念 → 白名單失效,下一則會重抓
     if cid:
         _concept_cache[name] = cid
     return cid
+
+
+def concept_names() -> list:
+    """回傳概念族群庫現有的概念名稱清單(快取;新建概念時自動失效)。
+    給新聞 AI 標概念時當白名單,使名稱一致;隨新增資料自動成長。"""
+    global _concept_names_cache
+    if _concept_names_cache is None:
+        _concept_names_cache = [c["name"] for c in list_concepts() if c.get("name")]
+    return list(_concept_names_cache)
 
 
 def ensure_concepts(names: list) -> list:
@@ -466,8 +478,10 @@ def find_concept(name: str):
 
 
 def rename_concept(concept_id: str, new_name: str) -> None:
+    global _concept_names_cache
     _patch(f"/pages/{concept_id}", {"properties": {"Name": {"title": [{"text": {"content": new_name[:200]}}]}}})
     _concept_cache.clear()  # 名稱→id 快取可能過期
+    _concept_names_cache = None
 
 
 def _relation_ids(page: dict, prop_name: str) -> list:

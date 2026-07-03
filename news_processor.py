@@ -831,27 +831,22 @@ def _update_concept_master(pairs, now: str) -> str:
 
 
 def _get_concept_whitelist() -> List[str]:
-    """讀「概念清單」分頁當白名單;不存在則用種子建立。結果快取(改清單需重啟生效)。"""
-    global _whitelist_cache
-    if _whitelist_cache is not None:
-        return _whitelist_cache
+    """概念白名單 = 內建種子 ∪ Notion 概念族群庫現有概念。
+    隨著新增資料到 Notion 自動成長(notion_timeline 會在新建概念時讓名稱快取失效),
+    AI 標概念時用它統一名稱。不再讀 Google Sheet。"""
+    names = list(_CONCEPT_SEED)
     try:
-        wb = _open_workbook()
-        try:
-            ws = wb.worksheet(CONCEPT_LIST_TAB)
-            items = [v.strip() for v in ws.col_values(1)[1:] if v.strip()]  # 跳過標題列
-            if not items:  # 分頁存在但沒內容 → 補種子
-                items = list(_CONCEPT_SEED)
-                ws.update(values=[[x] for x in items], range_name="A2")
-        except gspread.WorksheetNotFound:
-            ws = wb.add_worksheet(title=CONCEPT_LIST_TAB, rows=max(len(_CONCEPT_SEED) + 20, 120), cols=2)
-            ws.update(values=[["概念/題材標準名稱"]] + [[x] for x in _CONCEPT_SEED], range_name="A1")
-            items = list(_CONCEPT_SEED)
-        _whitelist_cache = items
-    except Exception as e:  # noqa: BLE001
-        logger.warning("讀取概念清單失敗,改用內建種子清單:%s", e)
-        _whitelist_cache = list(_CONCEPT_SEED)
-    return _whitelist_cache
+        if notion_timeline.enabled():
+            names += notion_timeline.concept_names()
+    except notion_timeline.NotionError as e:
+        logger.warning("讀 Notion 概念清單失敗,改用內建種子:%s", e)
+    out, seen = [], set()
+    for n in names:
+        n = (n or "").strip()
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
 
 
 # ==========================================================
