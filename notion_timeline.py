@@ -21,6 +21,9 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
 NOTION_VERSION = os.environ.get("NOTION_VERSION", "2025-09-03")
 TIMELINE_DS = os.environ.get("NOTION_TIMELINE_DS", "388da86b-7f8b-8139-ad5a-000b9477f4ef").strip()
 STOCK_DS = os.environ.get("NOTION_STOCK_DS", "388da86b-7f8b-817c-93ca-000b5553ac22").strip()
+CONCEPT_DS = os.environ.get("NOTION_CONCEPT_DS", "388da86b-7f8b-8177-8d81-000badfe5200").strip()
+GLOBAL_DS = os.environ.get("NOTION_GLOBAL_DS", "36694cc2-76ec-469e-9e78-1d0df333d79a").strip()
+KNOWLEDGE_DS = os.environ.get("NOTION_KNOWLEDGE_DS", "517dd7f8-6804-4048-bd0c-529a8cbe8b1a").strip()
 
 _API = "https://api.notion.com/v1"
 _STOCK_CODE_RE = re.compile(r"\d{3,6}")
@@ -31,6 +34,8 @@ EVENT_TYPES = {
     "擴廠進度", "試產進度", "量產進度", "發行可轉債", "CB掛牌", "CB拆解",
     "法說會", "股東會", "除權息", "增減資", "營收公布", "財報公布",
     "財報利空/多", "展覽/政策", "盤後隨筆", "每日關注", "其他",
+    # 新聞機器人搬進 Notion 後用的類型(時間軸視圖可用這幾個把「新聞卡」篩掉、只看真實時程)
+    "個股新聞", "產業新聞", "個股產業報告",
 }
 
 
@@ -62,6 +67,36 @@ def _patch(path: str, payload: dict) -> dict:
     if r.status_code >= 300:
         raise NotionError(f"Notion API {r.status_code}: {r.text[:300]}")
     return r.json()
+
+
+def _get(path: str) -> dict:
+    r = httpx.get(f"{_API}{path}", headers=_headers(), timeout=20)
+    if r.status_code >= 300:
+        raise NotionError(f"Notion API {r.status_code}: {r.text[:300]}")
+    return r.json()
+
+
+def _dedup(items) -> list:
+    """保序去重、去空白空值。"""
+    out, seen = [], set()
+    for x in items or []:
+        x = (x or "").strip() if isinstance(x, str) else x
+        if not x or x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def _multi_select(names) -> list:
+    """multi_select 選項名稱不可含逗號;清乾淨並保序去重。"""
+    out, seen = [], set()
+    for n in names or []:
+        n = (n or "").replace(",", " ").replace("，", " ").strip()[:100]
+        if n and n not in seen:
+            seen.add(n)
+            out.append({"name": n})
+    return out
 
 
 def archive_events_by_type_date(event_type: str, date_iso: str) -> int:
@@ -168,8 +203,10 @@ def add_event(
     source: str = "LINE",
     status: str = "",
     link: str = "",
+    stock_page_ids: list | None = None,
 ) -> dict:
-    """建立一筆時程事件頁,回傳 {'url'}。link 會寫進「來源連結」。"""
+    """建立一筆時程事件頁,回傳 {'url'}。link 會寫進「來源連結」。
+    stock_page_id(單檔,向下相容)與 stock_page_ids(多檔)可並用,內部合併去重。"""
     if event_type not in EVENT_TYPES:
         event_type = "其他"
     if not status:
@@ -188,10 +225,11 @@ def add_event(
         props["關鍵日期"] = {"date": date_val}
     if note:
         props["Quick Note"] = {"rich_text": [{"text": {"content": note[:1900]}}]}
-    if stock_page_id:
-        props["🔗 關聯個股"] = {"relation": [{"id": stock_page_id}]}
+    stock_ids = _dedup([*(stock_page_ids or []), stock_page_id])
+    if stock_ids:
+        props["🔗 關聯個股"] = {"relation": [{"id": i} for i in stock_ids]}
     if concept_ids:
-        props["🔗 概念族群"] = {"relation": [{"id": cid} for cid in concept_ids]}
+        props["🔗 概念族群"] = {"relation": [{"id": cid} for cid in _dedup(concept_ids)]}
     if link:
         props["來源連結"] = {"url": link}
 
@@ -211,3 +249,190 @@ def _infer_status(date_start: str, date_end: str = "") -> str:
     except (ValueError, TypeError):
         return "預定"
     return "已發生" if d < today else "預定"
+
+
+# ==========================================================
+# 概念族群:找/建概念頁、把概念掛到個股(取代舊 Google Sheet 概念股主表)
+# ==========================================================
+_concept_cache: dict = {}
+
+
+def find_or_create_concept(name: str) -> str:
+    """在概念族群庫用名稱找概念頁,沒有就建立。回傳頁 id(找不到/建不出回 "")。"""
+    name = (name or "").strip()
+    if not name:
+        return ""
+    if name in _concept_cache:
+        return _concept_cache[name]
+    data = _post(
+        f"/data_sources/{CONCEPT_DS}/query",
+        {"filter": {"property": "Name", "title": {"equals": name}}, "page_size": 1},
+    )
+    results = data.get("results", [])
+    if results:
+        cid = results[0]["id"]
+    else:
+        created = _post(
+            "/pages",
+            {
+                "parent": {"type": "data_source_id", "data_source_id": CONCEPT_DS},
+                "properties": {"Name": {"title": [{"text": {"content": name[:200]}}]}},
+            },
+        )
+        cid = created.get("id", "")
+    if cid:
+        _concept_cache[name] = cid
+    return cid
+
+
+def ensure_concepts(names: list) -> list:
+    """把一串概念名稱轉成概念頁 id(保序去重、逐一找或建)。"""
+    ids = []
+    for n in _dedup(names):
+        cid = find_or_create_concept(n)
+        if cid:
+            ids.append(cid)
+    return _dedup(ids)
+
+
+def link_stock_concepts(stock_page_id: str, concept_ids: list) -> bool:
+    """把 concept_ids 併進個股的「🔗 隸屬概念」(讀取現有→union→有變才寫)。
+    dual relation 會自動補概念庫的成員個股。回傳是否有更新。"""
+    if not stock_page_id or not concept_ids:
+        return False
+    page = _get(f"/pages/{stock_page_id}")
+    existing = [
+        r["id"] for r in page.get("properties", {}).get("🔗 隸屬概念", {}).get("relation", []) if r.get("id")
+    ]
+    merged = _dedup([*existing, *concept_ids])
+    if len(merged) == len(existing):
+        return False
+    _patch(
+        f"/pages/{stock_page_id}",
+        {"properties": {"🔗 隸屬概念": {"relation": [{"id": i} for i in merged]}}},
+    )
+    return True
+
+
+def find_news_by_link(ds_id: str, link: str):
+    """以「來源連結」url 精確比對查重;回傳既有頁或 None(link 空一律 None)。"""
+    link = (link or "").strip()
+    if not link:
+        return None
+    data = _post(
+        f"/data_sources/{ds_id}/query",
+        {"filter": {"property": "來源連結", "url": {"equals": link}}, "page_size": 1},
+    )
+    results = data.get("results", [])
+    return results[0] if results else None
+
+
+# ==========================================================
+# 全球局勢動態庫 / 知識補充庫 寫入
+# ==========================================================
+def add_global(title, summary="", topics=None, markets=None, date_start="",
+               note="", link="", source="新聞bot", status="") -> dict:
+    if not status:
+        status = _infer_status(date_start) if date_start else "已發生"
+    props: dict = {
+        "Name": {"title": [{"text": {"content": (title or "(未命名)")[:200]}}]},
+        "資料來源": {"select": {"name": source}},
+        "狀態": {"select": {"name": status}},
+    }
+    if summary:
+        props["AI 摘要"] = {"rich_text": [{"text": {"content": summary[:1900]}}]}
+    if topics:
+        props["影響主題"] = {"multi_select": _multi_select(topics)}
+    if markets:
+        props["受影響市場資產"] = {"multi_select": _multi_select(markets)}
+    if date_start:
+        props["關鍵日期"] = {"date": {"start": date_start}}
+    if note:
+        props["Quick Note"] = {"rich_text": [{"text": {"content": note[:1900]}}]}
+    if link:
+        props["來源連結"] = {"url": link}
+    data = _post("/pages", {"parent": {"type": "data_source_id", "data_source_id": GLOBAL_DS}, "properties": props})
+    return {"url": data.get("url", "")}
+
+
+def add_knowledge(topic, key_points_text="", keywords=None, link="", source="新聞bot") -> dict:
+    props: dict = {
+        "Name": {"title": [{"text": {"content": (topic or "(未命名)")[:200]}}]},
+        "資料來源": {"select": {"name": source}},
+    }
+    if key_points_text:
+        props["重點整理"] = {"rich_text": [{"text": {"content": key_points_text[:1900]}}]}
+    if keywords:
+        props["關鍵字"] = {"multi_select": _multi_select(keywords)}
+    if link:
+        props["來源連結"] = {"url": link}
+    data = _post("/pages", {"parent": {"type": "data_source_id", "data_source_id": KNOWLEDGE_DS}, "properties": props})
+    return {"url": data.get("url", "")}
+
+
+# ==========================================================
+# 反向查詢用:讀近期頁、把頁面屬性攤平成文字
+# ==========================================================
+def list_concepts() -> list:
+    """列出概念族群庫所有概念,回傳 [{'id','name'}](自動翻頁)。"""
+    results, cursor = [], None
+    while True:
+        payload = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        data = _post(f"/data_sources/{CONCEPT_DS}/query", payload)
+        for page in data.get("results", []):
+            title = page.get("properties", {}).get("Name", {}).get("title", [])
+            name = "".join(t.get("plain_text", "") for t in title).strip()
+            results.append({"id": page["id"], "name": name})
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return results
+
+
+def recent_pages(ds_id: str, n: int = 80) -> list:
+    """取某資料庫近期頁(依建立時間新到舊)。"""
+    data = _post(
+        f"/data_sources/{ds_id}/query",
+        {"sorts": [{"timestamp": "created_time", "direction": "descending"}], "page_size": min(max(n, 1), 100)},
+    )
+    return data.get("results", [])
+
+
+def _prop_to_text(prop: dict, id_name_map: dict | None = None) -> str:
+    t = prop.get("type")
+    if t == "title":
+        return "".join(x.get("plain_text", "") for x in prop.get("title", [])).strip()
+    if t == "rich_text":
+        return "".join(x.get("plain_text", "") for x in prop.get("rich_text", [])).strip()
+    if t == "select":
+        s = prop.get("select")
+        return s.get("name", "") if s else ""
+    if t == "multi_select":
+        return ", ".join(o.get("name", "") for o in prop.get("multi_select", []))
+    if t == "date":
+        d = prop.get("date")
+        if not d:
+            return ""
+        return d.get("start", "") + (f"~{d['end']}" if d.get("end") else "")
+    if t == "url":
+        return prop.get("url", "") or ""
+    if t == "relation":
+        ids = [r.get("id") for r in prop.get("relation", []) if r.get("id")]
+        if id_name_map:
+            return ", ".join(id_name_map.get(i, "") or i for i in ids)
+        return ", ".join(ids)
+    return ""
+
+
+def page_to_text(page: dict, id_name_map: dict | None = None, skip=("💡 自動辨別：相關族群",)) -> str:
+    """把一頁的所有屬性攤平成「欄名:值 | 欄名:值」,relation 用 id_name_map 換成名稱。"""
+    parts = []
+    for name, prop in page.get("properties", {}).items():
+        if name in skip:
+            continue
+        val = _prop_to_text(prop, id_name_map)
+        if val:
+            parts.append(f"{name}:{val}")
+    return " | ".join(parts)

@@ -239,7 +239,153 @@ _CONCEPT_RULE = (
 
 
 # ==========================================================
-# 分類設定(關鍵字 → 分頁 / 模型 / 提示 / 欄位 / 回覆)
+# Notion 寫入(取代 Google Sheet;每個分類一個 writer,回傳 (ok, 附註字串))
+# ==========================================================
+_AUTO_CREATE_STOCK = os.environ.get("AUTO_CREATE_STOCK", "1") != "0"
+
+
+def _valid_iso(s: str) -> str:
+    s = (s or "")[:10]
+    try:
+        datetime.date.fromisoformat(s)
+        return s
+    except (ValueError, TypeError):
+        return ""
+
+
+def _earliest_iso_date(timelines) -> str:
+    """從 timelines 挑一個合法日期當事件關鍵日期:優先最近的未來日期,否則最早的。"""
+    today = datetime.datetime.now(TW_TZ).date()
+    valid = [d for d in (_valid_iso(getattr(t, "date", "")) for t in (timelines or [])) if d]
+    if not valid:
+        return ""
+    future = [d for d in valid if datetime.date.fromisoformat(d) >= today]
+    return min(future) if future else min(valid)
+
+
+def _resolve_stocks(stock_strs):
+    """['2330 台積電', ...] → Notion 個股頁 ids(找不到且允許時自動新增)。回傳 (ids, warns)。"""
+    ids, warns = [], []
+    for s in stock_strs or []:
+        s = (s or "").strip()
+        if not s:
+            continue
+        page = None
+        try:
+            page = notion_timeline.find_stock_page("", s)
+        except notion_timeline.NotionError as e:
+            logger.warning("查個股頁失敗:%s", e)
+        if page is None and _AUTO_CREATE_STOCK:
+            try:
+                page = notion_timeline.create_stock_page("", s)
+                warns.append(f"🆕 已自動新增個股「{page['label']}」到個股主表")
+            except notion_timeline.NotionError as e:
+                logger.warning("自動新增個股失敗:%s", e)
+        if page and page.get("id"):
+            ids.append(page["id"])
+    return list(dict.fromkeys(ids)), warns
+
+
+def _write_news_event(title, url, *, event_type, stocks, concept_names, note, date_start=""):
+    """個股新聞/產業新聞/個股產業報告共用:寫一筆時程庫記錄、關聯所有個股與概念。回傳附註字串。"""
+    if url:
+        try:
+            if notion_timeline.find_news_by_link(notion_timeline.TIMELINE_DS, url):
+                return "(此連結先前已記錄過,略過重複寫入)"
+        except notion_timeline.NotionError as e:
+            logger.warning("查重失敗:%s", e)
+    ids, warns = _resolve_stocks(stocks)
+    concept_ids = []
+    try:
+        concept_ids = notion_timeline.ensure_concepts(concept_names)
+    except notion_timeline.NotionError as e:
+        logger.warning("建立概念失敗:%s", e)
+    notion_timeline.add_event(
+        title=title, date_start=date_start, event_type=event_type,
+        stock_page_ids=ids, concept_ids=concept_ids, note=note,
+        source="新聞bot", link=url,
+    )
+    for sid in ids:
+        try:
+            notion_timeline.link_stock_concepts(sid, concept_ids)
+        except notion_timeline.NotionError as e:
+            logger.warning("關聯個股概念失敗:%s", e)
+    return "\n".join(warns)
+
+
+def _notion_individual(a, title, url, now):
+    note = a.summary
+    if a.market:
+        note = f"市場:{a.market}\n{note}".strip()
+    tl = _fmt_timeline(a.timelines)
+    if tl:
+        note = f"{note}\n\n【關鍵時程】\n{tl}".strip()
+    add = _write_news_event(
+        title, url, event_type="個股新聞", stocks=a.mentioned_stocks,
+        concept_names=a.concept_groups, note=note, date_start=_earliest_iso_date(a.timelines),
+    )
+    return True, add
+
+
+def _notion_industry(a, title, url, now):
+    note = a.summary
+    kt = _fmt_bullets(a.key_trends)
+    if kt:
+        note = f"{note}\n\n【重點趨勢】\n{kt}".strip()
+    add = _write_news_event(
+        title, url, event_type="產業新聞", stocks=a.mentioned_stocks,
+        concept_names=a.industry_groups, note=note,
+    )
+    return True, add
+
+
+def _notion_report(a, title, url, now):
+    head = [x for x in (
+        f"券商:{a.broker}" if a.broker else "",
+        f"目標價:{a.target_price}" if a.target_price else "",
+        f"近期營收:{a.recent_revenue}" if a.recent_revenue else "",
+    ) if x]
+    tl = _fmt_timeline(a.timelines)
+    parts = [" | ".join(head), _fmt_report_summary(a), (f"【時間軸】\n{tl}" if tl else "")]
+    note = "\n\n".join(p for p in parts if p).strip()
+    date_start = _valid_iso(a.report_date) or _earliest_iso_date(a.timelines)
+    add = _write_news_event(
+        title, url, event_type="個股產業報告", stocks=a.stocks,
+        concept_names=a.concept_groups, note=note, date_start=date_start,
+    )
+    return True, add
+
+
+def _notion_global(a, title, url, now):
+    if url:
+        try:
+            if notion_timeline.find_news_by_link(notion_timeline.GLOBAL_DS, url):
+                return True, "(此連結先前已記錄過,略過重複寫入)"
+        except notion_timeline.NotionError as e:
+            logger.warning("查重失敗:%s", e)
+    notion_timeline.add_global(
+        title=title, summary=a.summary, topics=a.topics, markets=a.affected_markets,
+        date_start=_earliest_iso_date(a.timelines), note=_fmt_timeline(a.timelines), link=url,
+    )
+    return True, ""
+
+
+def _notion_knowledge(a, title, url, now):
+    if url:
+        try:
+            if notion_timeline.find_news_by_link(notion_timeline.KNOWLEDGE_DS, url):
+                return True, "(此連結先前已記錄過,略過重複寫入)"
+        except notion_timeline.NotionError as e:
+            logger.warning("查重失敗:%s", e)
+    notion_timeline.add_knowledge(
+        topic=(a.topic or title), key_points_text=_fmt_bullets(a.key_points),
+        keywords=a.keywords, link=url,
+    )
+    return True, ""
+
+
+# ==========================================================
+# 分類設定(關鍵字 → 模型 / 提示 / Notion 寫入 / 回覆)
 # ==========================================================
 @dataclass
 class CategoryConfig:
@@ -253,6 +399,8 @@ class CategoryConfig:
     format_reply: Callable
     # 回傳 [(個股字串, [概念標籤...]), ...] 供更新「概念股主表」;None = 此分類不參與
     to_concept_pairs: Callable = None
+    # 把分析結果寫進 Notion,回傳 (ok, 附註字串);取代舊 to_row/Sheet 寫入
+    to_notion: Callable = None
 
 
 INDIVIDUAL = CategoryConfig(
@@ -272,6 +420,7 @@ INDIVIDUAL = CategoryConfig(
         f"🗓️ 時程:\n{_fmt_timeline(a.timelines) or '  (無明確時程)'}"
     ),
     to_concept_pairs=lambda a: [(s, a.concept_groups) for s in a.mentioned_stocks],
+    to_notion=_notion_individual,
 )
 
 INDUSTRY = CategoryConfig(
@@ -290,6 +439,7 @@ INDUSTRY = CategoryConfig(
         f"📈 個股:{_join(a.mentioned_stocks) or '(無)'}"
     ),
     to_concept_pairs=lambda a: [(s, a.industry_groups) for s in a.mentioned_stocks],
+    to_notion=_notion_industry,
 )
 
 GLOBAL = CategoryConfig(
@@ -307,6 +457,7 @@ GLOBAL = CategoryConfig(
         f"💱 受影響市場/資產:{_join(a.affected_markets) or '(無)'}\n"
         f"🗓️ 時程:\n{_fmt_timeline(a.timelines) or '  (無明確時程)'}"
     ),
+    to_notion=_notion_global,
 )
 
 KNOWLEDGE = CategoryConfig(
@@ -323,6 +474,7 @@ KNOWLEDGE = CategoryConfig(
         f"📝 重點整理:\n{_fmt_bullets(a.key_points) or '  (無)'}\n"
         f"🔖 關鍵字:{_join(a.keywords) or '(無)'}"
     ),
+    to_notion=_notion_knowledge,
 )
 
 REPORT = CategoryConfig(
@@ -367,6 +519,7 @@ REPORT = CategoryConfig(
         f"🗓️ 時間軸:\n{_fmt_timeline(a.timelines) or '  (無明確時程)'}"
     ),
     to_concept_pairs=lambda a: [(s, a.concept_groups) for s in a.stocks],
+    to_notion=_notion_report,
 )
 
 # 關鍵字 → 分類(含別名);依長度由長到短比對,避免「個股」先吃掉「個股新聞」
@@ -766,23 +919,26 @@ def route_and_store(text: str) -> Result:
     if len(content.strip()) < 12:
         raise NoCategoryError(f"已辨識分類『{cfg.label}』,但下面沒看到內容。請在關鍵字的下一行貼上要記錄的內容,或貼一個新聞連結。")
 
+    if not notion_timeline.enabled():
+        raise NoCategoryError(
+            "⚠️ 尚未啟用 Notion:請先設定 NOTION_TOKEN,並把「股票投資大腦」頁面分享給該 integration。"
+        )
+
     content = content[:MAX_CONTENT_CHARS]
     title = fetched_title or _extract_title(content)
     analysis = _analyze(cfg, title, content)
     now = _now_str()
-    worksheet = _get_worksheet(cfg.tab, cfg.header)
-    worksheet.append_row(cfg.to_row(analysis, title, url, now), value_input_option="USER_ENTERED")
+
+    # 寫進 Notion(取代 Google Sheet);概念自動找/建並掛到個股
+    try:
+        _ok, addendum = cfg.to_notion(analysis, title, url, now)
+    except notion_timeline.NotionError as e:
+        logger.warning("寫入 Notion 失敗:%s", e)
+        raise NoCategoryError("⚠️ 寫入 Notion 失敗,請稍後再試一次。") from e
 
     reply = cfg.format_reply(analysis)
-    # 自動更新「概念股主表」(個股↔概念),失敗不影響存檔
-    if cfg.to_concept_pairs:
-        try:
-            addendum = _update_concept_master(cfg.to_concept_pairs(analysis), now)
-            if addendum:
-                reply = f"{reply}\n\n{addendum}"
-        except Exception as e:  # noqa: BLE001
-            logger.warning("更新概念股主表失敗(不影響存檔):%s", e)
-
+    if addendum:
+        reply = f"{reply}\n\n{addendum}"
     return Result(label=cfg.label, reply=reply)
 
 
@@ -1072,35 +1228,40 @@ def _handle_fetch_earnings(text: str):
 
 
 def _gather_corpus() -> str:
-    """把各分頁的近期資料攤平成精簡文字(較新的在前),供 AI 檢索。"""
-    workbook = _open_workbook()
+    """從 Notion 各庫撈近期資料攤平成精簡文字(較新的在前),供 AI 檢索。"""
+    nt = notion_timeline
+    if not nt.enabled():
+        return ""
     blocks: List[str] = []
-    for cfg in ALL_CONFIGS:
-        try:
-            ws = workbook.worksheet(cfg.tab)
-        except gspread.WorksheetNotFound:
-            continue
-        rows = ws.get_all_values()
-        if len(rows) <= 1:
-            continue
-        header, data = rows[0], rows[1:]
-        for r in reversed(data[-QUERY_ROWS_PER_TAB:]):  # 新的在前
-            cells = [f"{h}:{v}" for h, v in zip(header, r) if v.strip()]
-            if cells:
-                blocks.append(f"〔{cfg.label}〕" + " | ".join(cells))
 
-    # 附上概念股主表(個股↔概念對照),方便回答「某檔有哪些概念/某概念有哪些股」
+    # 個股 ↔ 概念 對照,並建 id→名稱 對照表(供 relation 欄位換名)
+    id_name: dict = {}
     try:
-        ws = workbook.worksheet(CONCEPT_MASTER_TAB)
-        rows = ws.get_all_values()
-        if len(rows) > 1:
-            header = rows[0]
-            for r in rows[1:]:
-                if r and r[0].strip():
-                    cells = [f"{h}:{v}" for h, v in zip(header, r) if v.strip()]
-                    blocks.append("〔概念股主表〕" + " | ".join(cells))
-    except gspread.WorksheetNotFound:
-        pass
+        stocks = nt.list_stocks()
+        concepts = nt.list_concepts()
+        id_name = {s["id"]: s["label"] for s in stocks}
+        id_name.update({c["id"]: c["name"] for c in concepts})
+        for s in stocks:
+            cnames = [id_name.get(cid, "") for cid in s.get("concept_ids", [])]
+            cnames = [c for c in cnames if c]
+            if cnames:
+                blocks.append(f"〔個股概念〕{s['label']}:{', '.join(cnames)}")
+    except nt.NotionError as e:
+        logger.warning("讀個股/概念對照失敗:%s", e)
+
+    # 新聞與時程動態庫 / 全球局勢 / 知識
+    for ds_id, tag, use_map in (
+        (nt.TIMELINE_DS, "新聞/時程", True),
+        (nt.GLOBAL_DS, "全球局勢", False),
+        (nt.KNOWLEDGE_DS, "知識", False),
+    ):
+        try:
+            for pg in nt.recent_pages(ds_id, QUERY_ROWS_PER_TAB):
+                txt = nt.page_to_text(pg, id_name if use_map else None)
+                if txt:
+                    blocks.append(f"〔{tag}〕" + txt)
+        except nt.NotionError as e:
+            logger.warning("讀 %s 失敗:%s", tag, e)
 
     return "\n".join(blocks)[:QUERY_CHAR_BUDGET]
 
@@ -1118,7 +1279,7 @@ def _answer_query(question: str) -> Result:
     )
     user_prompt = (
         f"今天是 {today}(台灣時間)。\n\n"
-        f"以下是使用者 Google Sheet 投資筆記資料庫(較新的在前):\n\n{corpus}\n\n"
+        f"以下是使用者 Notion 投資筆記資料庫(較新的在前):\n\n{corpus}\n\n"
         f"---\n使用者的問題:{question}\n\n請只根據上面的資料庫內容回答。"
     )
     completion = _get_ai_client().chat.completions.create(
