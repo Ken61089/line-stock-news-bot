@@ -40,7 +40,8 @@ TYPE_EMOJI = {
     "法說會": "🎤", "股東會": "🏛️", "CB掛牌": "📈", "CB拆解": "✂️",
     "發行可轉債": "💵", "除權息": "💰", "增減資": "🔀", "營收公布": "📊",
     "財報公布": "📋", "財報利空/多": "⚠️", "擴廠進度": "🏭", "試產進度": "🧪",
-    "量產進度": "🚀", "展覽/政策": "📰", "盤後隨筆": "📝", "每日關注": "👀", "其他": "📌",
+    "量產進度": "🚀", "展覽/政策": "📰", "盤後隨筆": "📝", "每日關注": "👀",
+    "隨手筆記": "✏️", "其他": "📌",
 }
 DEFAULT_EMOJI = "📌"
 
@@ -273,10 +274,20 @@ EARNINGS_LEAD_DAYS = int(os.environ.get("EARNINGS_LEAD_DAYS", "2"))
 _PREVIEW_TYPES = {"法說會"}
 
 
+def format_notes(notes: list[dict], day: datetime.date) -> str:
+    """今日隨筆彙整區塊(依時間排序,標記錄時間)。"""
+    head = f"📝 今日隨筆彙整 {day.month}/{day.day}"
+    body = "\n".join(
+        f"・{n['time'] + ' ' if n.get('time') else ''}{n['title']}" for n in notes
+    )
+    return f"{head}\n{body}"
+
+
 # ---- 排程任務 ----
 def notify_daily(dry_run: bool = False) -> str | None:
     today = datetime.datetime.now(TW_TZ).date()
-    events = query_events(today, today)
+    # 隨手筆記只在 21:00 彙整,不在早上出現
+    events = query_events(today, today, extra_exclude={"隨手筆記"})
 
     # 法說會提前預告:未來 1~EARNINGS_LEAD_DAYS 天內的法說會(僅預告類型)
     preview = []
@@ -300,13 +311,18 @@ def notify_daily(dry_run: bool = False) -> str | None:
 
 
 def notify_tomorrow(dry_run: bool = False) -> str | None:
-    tomorrow = datetime.datetime.now(TW_TZ).date() + datetime.timedelta(days=1)
-    # 「每日關注」盯盤筆記只在當天 07:00 推,不在前一晚 21:00 重複
-    events = query_events(tomorrow, tomorrow, extra_exclude={"每日關注"})
-    if not events:
-        logger.info("明日(%s)無事件,不推播。", tomorrow)
+    today = datetime.datetime.now(TW_TZ).date()
+    tomorrow = today + datetime.timedelta(days=1)
+    # 明日事件(排除盯盤筆記與隨手筆記);今日隨筆另段彙整
+    events = query_events(tomorrow, tomorrow, extra_exclude={"每日關注", "隨手筆記"})
+    notes = nt.list_notes_by_date(today.isoformat(), "隨手筆記")
+    if not events and not notes:
+        logger.info("明日(%s)無事件、今日無隨筆,不推播。", tomorrow)
         return None
-    msg = format_daily(events, tomorrow, label="明日", emoji="🌙")
+    parts = [format_daily(events, tomorrow, label="明日", emoji="🌙")]
+    if notes:
+        parts.append(format_notes(notes, today))
+    msg = "\n\n".join(parts)
     if dry_run:
         return msg
     push(msg)
@@ -318,8 +334,8 @@ def notify_weekly(dry_run: bool = False) -> str | None:
     # 下週一 = 今天之後最近的週一;下週日 = 下週一 + 6
     next_mon = today + datetime.timedelta(days=(7 - today.weekday()))
     next_sun = next_mon + datetime.timedelta(days=6)
-    # 週報只放真實行事曆事件,不含每日盯盤筆記
-    events = query_events(next_mon, next_sun, extra_exclude={"每日關注"})
+    # 週報只放真實行事曆事件,不含盯盤筆記/隨手筆記
+    events = query_events(next_mon, next_sun, extra_exclude={"每日關注", "隨手筆記"})
     msg = format_weekly(events, next_mon, next_sun)
     if dry_run:
         return msg

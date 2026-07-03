@@ -250,9 +250,20 @@ def _earliest_iso_date(timelines) -> str:
     return min(future) if future else min(valid)
 
 
+_STOCK_CODE_RE = re.compile(r"\d{3,6}")
+
+
+def _is_non_stock_code(s: str) -> bool:
+    """個股字串的代號為 5~6 位數(可轉債 CB、ETF 等,非一般四碼現股)→ 不自動建檔。"""
+    m = _STOCK_CODE_RE.search(s or "")
+    return bool(m) and len(m.group(0)) >= 5
+
+
 def _resolve_stocks(stock_strs):
-    """['2330 台積電', ...] → Notion 個股頁 ids(找不到且允許時自動新增)。回傳 (ids, warns)。"""
-    ids, warns = [], []
+    """['2330 台積電', ...] → Notion 個股頁 ids。找不到才視情況自動新增:
+    一般四碼現股(或無代號的名稱)會建檔;5~6 碼(CB/ETF 等非現股)不建檔。
+    回傳 (ids, warns, skipped);skipped 為未建檔的 CB/非現股字串。"""
+    ids, warns, skipped = [], [], []
     for s in stock_strs or []:
         s = (s or "").strip()
         if not s:
@@ -262,15 +273,20 @@ def _resolve_stocks(stock_strs):
             page = notion_timeline.find_stock_page("", s)
         except notion_timeline.NotionError as e:
             logger.warning("查個股頁失敗:%s", e)
-        if page is None and _AUTO_CREATE_STOCK:
-            try:
-                page = notion_timeline.create_stock_page("", s)
-                warns.append(f"🆕 已自動新增個股「{page['label']}」到個股主表")
-            except notion_timeline.NotionError as e:
-                logger.warning("自動新增個股失敗:%s", e)
+        if page is None:
+            # 個股主表查無此檔:CB/非現股(5~6碼)不建檔;其餘(四碼現股或名稱)才自動建
+            if _is_non_stock_code(s):
+                skipped.append(s)
+                continue
+            if _AUTO_CREATE_STOCK:
+                try:
+                    page = notion_timeline.create_stock_page("", s)
+                    warns.append(f"🆕 已自動新增個股「{page['label']}」到個股主表")
+                except notion_timeline.NotionError as e:
+                    logger.warning("自動新增個股失敗:%s", e)
         if page and page.get("id"):
             ids.append(page["id"])
-    return list(dict.fromkeys(ids)), warns
+    return list(dict.fromkeys(ids)), warns, skipped
 
 
 def _write_news_event(title, url, *, event_type, stocks, concept_names, note, date_start=""):
@@ -281,7 +297,11 @@ def _write_news_event(title, url, *, event_type, stocks, concept_names, note, da
                 return "(此連結先前已記錄過,略過重複寫入)"
         except notion_timeline.NotionError as e:
             logger.warning("查重失敗:%s", e)
-    ids, warns = _resolve_stocks(stocks)
+    ids, warns, skipped = _resolve_stocks(stocks)
+    # CB/非現股不建檔,但仍把它保留在內文,資訊不遺失
+    if skipped:
+        note = f"{note}\n\n提及(未建檔·CB/非現股):{', '.join(skipped)}".strip()
+        warns.append(f"ℹ️ 未建檔(5~6碼 CB/非現股):{', '.join(skipped)}")
     concept_ids = []
     try:
         concept_ids = notion_timeline.ensure_concepts(concept_names)
@@ -554,6 +574,16 @@ _WATCHLIST_USAGE = (
     "📌 同一天再打一次「關注」= 整批更新成最新版(會蓋掉當天舊的)"
 )
 
+# 隨手筆記:團隊隨時記,當天 21:00 隨推播彙整;「今日隨筆」可即時叫出當天已記的
+_NOTE_PREFIXES = ("隨筆", "隨手筆記", "隨手記", "備忘")
+_NOTE_TYPE = "隨手筆記"
+_TODAY_NOTES_WORDS = {"今日隨筆", "今天隨筆", "本日隨筆", "今日筆記", "今天筆記"}
+_NOTE_USAGE = (
+    "📝 隨筆用法:「隨筆」後面接想記的內容(可多行),例如:\n"
+    "隨筆 台積電 CoWoS 產能吃緊,留意設備股\n"
+    "當天的隨筆會在晚上 21:00 隨推播彙整;打「今日隨筆」可即時叫出當天已記的。"
+)
+
 # 「說明」指令:整段訊息完全等於這些字才觸發(避免新聞內文誤中)
 _HELP_WORDS = {"說明", "help", "指令", "幫助", "用法", "選單", "menu", "?", "？"}
 _HELP_TEXT = (
@@ -573,6 +603,10 @@ _HELP_TEXT = (
     "━━ 隔日盯盤 ━━(「關注」開頭,隔天 07:00 隨推播通知)\n"
     "• 關注 2330 台積電 站上季線再追\n"
     "• 多檔:「關注」換行後一行一檔\n"
+    "\n"
+    "━━ 隨手筆記 ━━(隨時記,當天 21:00 隨推播彙整)\n"
+    "• 隨筆 台積電CoWoS產能吃緊,留意設備股\n"
+    "• 打「今日隨筆」叫出今天已記的(依時間排序)\n"
     "\n"
     "━━ 法說會自動更新 ━━(每天自動抓,也可手動)\n"
     "• 打「更新法說會」→ 立即抓追蹤股的法說會進時程\n"
@@ -608,10 +642,12 @@ def is_group_additive_command(text: str) -> bool:
         return False
     if s.lower() in _HELP_WORDS:
         return True
+    if s in _TODAY_NOTES_WORDS:
+        return True
     first = s.splitlines()[0].strip()
     additive_prefixes = (
         tuple(_TIMELINE_PREFIXES) + tuple(_WATCHLIST_PREFIXES)
-        + tuple(_FETCH_EARNINGS_PREFIXES)
+        + tuple(_NOTE_PREFIXES) + tuple(_FETCH_EARNINGS_PREFIXES)
     )
     if QUERY_ENABLED:
         additive_prefixes += tuple(_QUERY_PREFIXES)
@@ -773,6 +809,16 @@ def route_and_store(text: str) -> Result:
     watchlist = _handle_watchlist(text)
     if watchlist is not None:
         return watchlist
+
+    # 「今日隨筆」→ 列出當天已記的隨筆(依時間排序);要在 _handle_note 之前判斷
+    today_notes = _handle_today_notes(text)
+    if today_notes is not None:
+        return today_notes
+
+    # 「隨筆」開頭 → 記一則隨手筆記,寫進 Notion(當天 21:00 隨推播彙整)
+    note = _handle_note(text)
+    if note is not None:
+        return note
 
     # 「更新法說會/抓法說會」→ 立即抓 money-link 法說會寫進時程庫
     fetched = _handle_fetch_earnings(text)
@@ -948,13 +994,19 @@ def _handle_timeline(text: str):
 
     if stock is None and (data.stock_code or data.stock_name):
         auto_create = os.environ.get("AUTO_CREATE_STOCK", "1") != "0"
-        if auto_create:
+        is_cb = _is_non_stock_code(f"{data.stock_code} {data.stock_name}")
+        if auto_create and not is_cb:
             try:
                 stock = notion_timeline.create_stock_page(data.stock_code, data.stock_name)
                 auto_created = True
             except notion_timeline.NotionError as e:
                 logger.warning("自動新增個股失敗:%s", e)
-        if stock is None:
+        if stock is None and is_cb:
+            warn = (
+                f"\nℹ️「{(data.stock_code + ' ' + data.stock_name).strip()}」為 5~6 碼(CB/非現股),"
+                "已建事件但未建檔到個股主表(只有一般四碼現股才自動建檔)。"
+            )
+        elif stock is None:
             warn = (
                 f"\n⚠️ 個股主表查無「{(data.stock_code + ' ' + data.stock_name).strip()}」,"
                 "已建事件但未關聯(概念分類需要關聯個股)。可先在個股主表新增此股,再手動連結。"
@@ -1086,6 +1138,59 @@ def _handle_watchlist(text: str):
         f"{tail}"
     )
     return Result(label="關注", reply=reply)
+
+
+def _handle_note(text: str):
+    """開頭是「隨筆/隨手筆記/隨手記/備忘」→ 記一則隨手筆記(當天日期)寫進 Notion;否則 None。"""
+    s = text.strip()
+    lines = s.splitlines()
+    first = lines[0].strip() if lines else ""
+    matched = next((p for p in _NOTE_PREFIXES if first.startswith(p)), None)
+    if matched is None:
+        return None
+    if not notion_timeline.enabled():
+        raise NoCategoryError("⚠️ 隨筆功能尚未啟用:請先設定 NOTION_TOKEN。")
+
+    # 內容 = 第一行去掉前綴後的剩餘 + 後續各行(保留換行)
+    head = first[len(matched):].strip(" :：、,，.。\n")
+    rest = "\n".join(lines[1:]).strip()
+    content = (head + ("\n" + rest if rest else "")).strip() if head else rest
+    if not content:
+        raise NoCategoryError(_NOTE_USAGE)
+
+    # Quick Note 首行存記錄當下的完整 ISO 時間當排序鍵(Notion 時間欄位只有分鐘精度,
+    # 無法秒級排序);若內容超過標題長度,接在時間戳後面保存完整內容。
+    now = datetime.datetime.now(notion_timeline.TW_TZ)
+    overflow = content if len(content) > 200 else ""
+    quick = now.isoformat(timespec="seconds") + (("\n" + overflow) if overflow else "")
+    notion_timeline.add_event(
+        title=content[:200],
+        date_start=now.date().isoformat(),
+        event_type=_NOTE_TYPE,
+        note=quick,
+        source="LINE",
+        status="已發生",
+    )
+    preview = content if len(content) <= 60 else content[:60] + "…"
+    return Result(
+        label="隨筆",
+        reply=f"📝 已記錄隨筆:\n{preview}\n\n今晚 21:00 會彙整今天的隨筆一起推播;打「今日隨筆」可即時查看。",
+    )
+
+
+def _handle_today_notes(text: str):
+    """整段訊息是「今日隨筆」等 → 列出當天已記的隨筆(依時間排序);否則 None。"""
+    if text.strip() not in _TODAY_NOTES_WORDS:
+        return None
+    if not notion_timeline.enabled():
+        raise NoCategoryError("⚠️ 尚未啟用:請先設定 NOTION_TOKEN。")
+    today = datetime.datetime.now(notion_timeline.TW_TZ).date()
+    notes = notion_timeline.list_notes_by_date(today.isoformat(), _NOTE_TYPE)
+    head = f"📝 今日隨筆 {today.month}/{today.day}"
+    if not notes:
+        return Result(label="今日隨筆", reply=f"{head}\n\n(今天還沒有隨筆,用「隨筆 …」開始記)")
+    body = "\n".join(f"・{n['time'] + ' ' if n['time'] else ''}{n['title']}" for n in notes)
+    return Result(label="今日隨筆", reply=f"{head}(共 {len(notes)} 則)\n\n{body}")
 
 
 _FETCH_EARNINGS_PREFIXES = ("更新法說會", "抓法說會", "法說會更新")

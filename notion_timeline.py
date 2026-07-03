@@ -33,7 +33,7 @@ TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
 EVENT_TYPES = {
     "擴廠進度", "試產進度", "量產進度", "發行可轉債", "CB掛牌", "CB拆解",
     "法說會", "股東會", "除權息", "增減資", "營收公布", "財報公布",
-    "財報利空/多", "展覽/政策", "盤後隨筆", "每日關注", "其他",
+    "財報利空/多", "展覽/政策", "盤後隨筆", "每日關注", "隨手筆記", "其他",
     # 新聞機器人搬進 Notion 後用的類型(時間軸視圖可用這幾個把「新聞卡」篩掉、只看真實時程)
     "個股新聞", "產業新聞", "個股產業報告",
 }
@@ -117,6 +117,38 @@ def archive_events_by_type_date(event_type: str, date_iso: str) -> int:
         _patch(f"/pages/{pg['id']}", {"archived": True})
         n += 1
     return n
+
+
+def list_notes_by_date(date_iso: str, event_type: str = "隨手筆記") -> list[dict]:
+    """查某日某類型事件,依「記錄精確時間」排序,回傳 [{'title','time'(台灣 HH:MM)}]。
+    Notion 所有時間欄位(created_time、日期)都只有分鐘精度,無法秒級排序;隨手筆記把
+    記錄當下的完整 ISO 時間寫在 Quick Note 首行當排序鍵,故此處在 Python 端秒級排序。"""
+    payload = {
+        "filter": {
+            "and": [
+                {"property": "事件類型", "select": {"equals": event_type}},
+                {"property": "關鍵日期", "date": {"equals": date_iso}},
+            ]
+        },
+        "page_size": 100,
+    }
+    data = _post(f"/data_sources/{TIMELINE_DS}/query", payload)
+    out = []
+    for pg in data.get("results", []):
+        props = pg.get("properties", {})
+        title = "".join(
+            t.get("plain_text", "") for t in props.get("Name", {}).get("title", [])
+        ).strip()
+        quick = "".join(t.get("plain_text", "") for t in props.get("Quick Note", {}).get("rich_text", []))
+        stamp = quick.splitlines()[0].strip() if quick else ""
+        hhmm = ""
+        try:
+            hhmm = datetime.datetime.fromisoformat(stamp).astimezone(TW_TZ).strftime("%H:%M")
+        except (ValueError, TypeError):
+            stamp = ""  # 排序鍵無效者(空字串)排最前
+        out.append({"title": title or "(空白筆記)", "time": hhmm, "_k": stamp})
+    out.sort(key=lambda x: x["_k"])
+    return [{"title": x["title"], "time": x["time"]} for x in out]
 
 
 def find_stock_page(code: str, name: str = "") -> dict | None:
