@@ -90,8 +90,19 @@ def _process_and_reply(reply_token: str, user_id: str, text: str) -> None:
     _say(reply_token, user_id, result.reply)
 
 
+# ---- 背景執行「列出事件」查詢並回覆 ----
+def _reply_list_events(reply_token: str, user_id: str, text: str) -> None:
+    try:
+        reply = calendar_notify.run_list_events(text)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("列出事件失敗")
+        reply = f"❌ 列出事件失敗:{e}"
+    if reply:
+        _say(reply_token, user_id, reply)
+
+
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-07-03-query-off"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-07-03-list-events"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
@@ -132,7 +143,16 @@ def callback():
             _say(reply_token, user_id, "\n".join(lines))
             continue
 
-        # 群組/聊天室:團隊成員可下「新增/查詢類」指令(時程/關注/更新法說會/存新聞/查詢),
+        # 「列出事件」查詢(本週/下週/指定日期):唯讀,群組與私訊都可用
+        if calendar_notify.is_list_events_command(text):
+            threading.Thread(
+                target=_reply_list_events,
+                args=(reply_token, user_id, text),
+                daemon=True,
+            ).start()
+            continue
+
+        # 群組/聊天室:團隊成員可下「新增類」指令(時程/關注/更新法說會/存新聞),
         # 一般聊天與破壞性指令(改股/主表修正)一律忽略,避免洗版與誤改。
         if group_id or room_id:
             if is_group_additive_command(text):

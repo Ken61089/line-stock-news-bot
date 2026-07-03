@@ -23,6 +23,7 @@ CB拆解/經濟數據公布…等),依排程主動推播到指定 LINE 群組。
 """
 
 import os
+import re
 import logging
 import datetime
 
@@ -135,6 +136,105 @@ def format_earnings_preview(events: list[dict], today: datetime.date) -> str:
         emoji = TYPE_EMOJI.get(ev["type"], "🎤")
         lines.append(f"{emoji} {dd.month}/{dd.day}(週{w}・{when}) {ev['title']}")
     return "📢 法說會預告\n" + "\n".join(lines)
+
+
+# ---- 隨選「列出事件」:本週/下週/指定日期或範圍 ----
+_LIST_WEEK_WORDS = {"本週", "本周", "這週", "這周", "本週事件", "本周事件",
+                    "這週事件", "這周事件", "本週行事曆", "本周行事曆"}
+_LIST_NEXTWEEK_WORDS = {"下週", "下周", "下週事件", "下周事件", "下週行事曆", "下周行事曆"}
+_LIST_DATE_RE = re.compile(r"^(?:(\d{4})[/-])?(\d{1,2})[/.](\d{1,2})$")
+_LIST_USAGE = (
+    "🗓️ 列出用法:\n"
+    "• 列出本週 / 列出下週\n"
+    "• 列出 7/10(指定某天)\n"
+    "• 列出 7/10~7/15(指定範圍)"
+)
+
+
+def is_list_events_command(text: str) -> bool:
+    """快速判斷是否為「列出事件」指令(不連網):本週/下週,或「列出…」開頭。"""
+    s = (text or "").strip()
+    if not s:
+        return False
+    first = s.splitlines()[0].strip()
+    return first in _LIST_WEEK_WORDS or first in _LIST_NEXTWEEK_WORDS or first.startswith("列出")
+
+
+def _parse_one_date(s: str, today: datetime.date):
+    m = _LIST_DATE_RE.match(s.strip())
+    if not m:
+        return None
+    y, mo, d = m.groups()
+    try:
+        return datetime.date(int(y) if y else today.year, int(mo), int(d))
+    except ValueError:
+        return None
+
+
+def _this_week(today):
+    mon = today - datetime.timedelta(days=today.weekday())
+    return mon, mon + datetime.timedelta(days=6)
+
+
+def _next_week(today):
+    mon = today + datetime.timedelta(days=(7 - today.weekday()))
+    return mon, mon + datetime.timedelta(days=6)
+
+
+def _resolve_list_range(arg: str, today: datetime.date):
+    """把「列出」後面的參數解析成 (start, end, label);解析不出回 None。"""
+    arg = (arg or "").strip()
+    if arg in ("", "本週", "本周", "這週", "這周"):
+        s, e = _this_week(today)
+        return s, e, "本週"
+    if arg in ("下週", "下周"):
+        s, e = _next_week(today)
+        return s, e, "下週"
+    parts = re.split(r"\s*(?:~|～|-|到|至)\s*", arg)
+    if len(parts) == 2:
+        d1, d2 = _parse_one_date(parts[0], today), _parse_one_date(parts[1], today)
+        if d1 and d2:
+            s, e = (d1, d2) if d1 <= d2 else (d2, d1)
+            return s, e, "指定範圍"
+    d = _parse_one_date(arg, today)
+    if d:
+        return d, d, "指定日期"
+    return None
+
+
+def format_event_list(events, start, end, label) -> str:
+    single = start == end
+    if single:
+        head = f"🗓️ {label} {start.month}/{start.day}(週{_WEEKDAY_ZH[start.weekday()]}) 事件"
+    else:
+        head = (f"🗓️ {label} 事件\n{start.month}/{start.day}(週{_WEEKDAY_ZH[start.weekday()]})"
+                f" ~ {end.month}/{end.day}(週{_WEEKDAY_ZH[end.weekday()]})")
+    if not events:
+        return head + "\n\n(這段期間沒有排定事件)"
+    body = "\n".join(_fmt_line(ev, with_date=not single)
+                     for ev in sorted(events, key=lambda e: e["start"]))
+    return head + "\n\n" + body
+
+
+def run_list_events(text: str) -> str | None:
+    """執行「列出事件」查詢並回傳訊息;非此指令回 None。"""
+    s = (text or "").strip()
+    first = s.splitlines()[0].strip() if s else ""
+    today = datetime.datetime.now(TW_TZ).date()
+    if first in _LIST_WEEK_WORDS:
+        rng = (*_this_week(today), "本週")
+    elif first in _LIST_NEXTWEEK_WORDS:
+        rng = (*_next_week(today), "下週")
+    elif first.startswith("列出"):
+        rng = _resolve_list_range(first[len("列出"):], today)
+        if rng is None:
+            return _LIST_USAGE
+    else:
+        return None
+    start, end, label = rng
+    # 盯盤筆記不算行事曆事件,列表時排除
+    events = query_events(start, end, extra_exclude={"每日關注", "隨手筆記"})
+    return format_event_list(events, start, end, label)
 
 
 def format_weekly(events: list[dict], start: datetime.date, end: datetime.date) -> str:
