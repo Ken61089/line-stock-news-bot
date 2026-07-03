@@ -1231,7 +1231,7 @@ def _handle_fetch_earnings(text: str):
     ]
     if res["added_items"]:
         lines.append("")
-        lines += [f"• {it}" for it in res["added_items"][:20]]
+        lines += [f"• {it}" for it in res["added_items"][:60]]
     elif res["added"] == 0:
         lines.append("(追蹤股近期法說會都已在時程庫,無新增)")
     return Result(label="法說會更新", reply="\n".join(lines))
@@ -1257,7 +1257,7 @@ def _handle_fetch_econ(text: str):
     ]
     if res["added_items"]:
         lines.append("")
-        lines += [f"• {it}" for it in res["added_items"][:20]]
+        lines += [f"• {it}" for it in res["added_items"][:60]]
     elif res["added"] == 0:
         lines.append("(近期美國經濟事件都已在時程庫,無新增)")
     return Result(label="經濟數據更新", reply="\n".join(lines))
