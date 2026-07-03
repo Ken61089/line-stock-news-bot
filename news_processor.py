@@ -1307,10 +1307,12 @@ _MASTER_HELP = (
     "• 主表 刪除 <概念>            例:主表 刪除 半導體"
 )
 _EDIT_HELP = (
-    "🛠️ 修改某一筆新聞指令:\n"
+    "🛠️ 修改某一筆新聞(Notion)指令:\n"
     "改 <分類> <關鍵字> <欄位>:<新值>\n"
-    "例:改 產業報告 全新 目標價:500元\n"
-    "(會找該分類中最近一筆含關鍵字的資料列來改)"
+    "例:改 個股新聞 光聖 日期:2026-08-15\n"
+    "可改欄位:標題、內容(摘要/備註)、日期、連結、狀態、類型\n"
+    "(找該分類最近一筆含關鍵字的記錄來改;產業報告的目標價/券商等細項收在「內容」裡,"
+    "請整段改內容或直接到 Notion 編輯)"
 )
 
 
@@ -1345,84 +1347,59 @@ def _handle_correction(text: str):
     first = text.strip().splitlines()[0].strip() if text.strip() else ""
     if first.startswith("主表"):
         return _master_command(text)
-    # 全面改股(所有分頁)— 需在通用「改」之前判斷
+    # 全面改股:把舊股頁併到新股頁(概念與新聞關聯一起搬)— 需在通用「改」之前判斷
     for p in ("改股", "換股", "全部改股"):
         if first.startswith(p):
             old, new = _split_colon(first[len(p):])
             if not old or not new:
-                return Result("改股", "用法:改股 <舊>:<新>(一次修正所有分頁)\n例:改股 8111:6442 光聖")
-            return _global_fix_stock(old, new)
+                return Result("改股", "用法:改股 <舊>:<新>(把舊股併到新股)\n例:改股 8111:6442 光聖")
+            return _merge_stock(old, new)
     for p in ("修改", "改"):
         if first.startswith(p):
             return _edit_row_command(text, p)
     return None
 
 
-def _global_fix_stock(old: str, new: str) -> Result:
-    """把股號 old 在『所有分頁』(各新聞分頁的個股欄 + 概念股主表成分股)一次換成 new。"""
-    now = _now_str()
-    oldkey = _stock_key(old)
-    wb = _open_workbook()
-    report = []
-
-    def _fix_cell(stocks):
-        out = []
-        for x in stocks:
-            x2 = new if _stock_key(x) == oldkey else x
-            if not any(_stock_key(x2) == _stock_key(y) for y in out):
-                out.append(x2)
-        return out
-
-    # 1) 概念股主表(整列 A:E,順便更新個股數與最近出現)
+def _merge_stock(old: str, new: str) -> Result:
+    """把打錯的股 old 併到正確股 new(Notion):把 old 的隸屬概念與相關新聞/時程都改掛到 new,再封存 old 頁。"""
+    nt = notion_timeline
+    if not nt.enabled():
+        return Result("改股", "⚠️ 尚未啟用 Notion:請先設定 NOTION_TOKEN。")
     try:
-        mws = wb.worksheet(CONCEPT_MASTER_TAB)
-        rows = mws.get_all_values()
-        n = 0
-        for i, r in enumerate(rows[1:], start=2):
-            cur = _split_list(r[1]) if len(r) > 1 else []
-            if not any(_stock_key(x) == oldkey for x in cur):
-                continue
-            newlist = _fix_cell(cur)
-            first_seen = r[3] if (len(r) > 3 and r[3].strip()) else now
-            mws.update(values=[[r[0].strip(), ", ".join(newlist), len(newlist), first_seen, now]],
-                       range_name=f"A{i}:E{i}", value_input_option="USER_ENTERED")
-            n += 1
-        if n:
-            report.append(f"概念股主表:{n} 個概念")
-    except gspread.WorksheetNotFound:
-        pass
+        oldpage = nt.find_stock_page("", old)
+    except nt.NotionError as e:
+        return Result("改股", f"⚠️ 查詢失敗:{str(e)[:150]}")
+    if not oldpage:
+        return Result("改股", f"⚠️ 個股主表找不到「{old}」")
+    try:
+        newpage = nt.find_stock_page("", new) or nt.create_stock_page("", new)
+    except nt.NotionError as e:
+        return Result("改股", f"⚠️ 建/找新股失敗:{str(e)[:150]}")
+    if oldpage["id"] == newpage["id"]:
+        return Result("改股", f"⚠️「{old}」與「{new}」指到同一檔,未變更")
 
-    # 2) 各新聞分頁的個股欄
-    for cfg in ALL_CONFIGS:
-        try:
-            ws = wb.worksheet(cfg.tab)
-        except gspread.WorksheetNotFound:
-            continue
-        rows = ws.get_all_values()
-        if not rows:
-            continue
-        col = next((j for j, h in enumerate(rows[0]) if h.strip() in ("個股", "提及個股")), None)
-        if col is None:
-            continue
-        n = 0
-        for i, r in enumerate(rows[1:], start=2):
-            if len(r) <= col:
-                continue
-            stocks = _split_list(r[col])
-            if not any(_stock_key(x) == oldkey for x in stocks):
-                continue
-            ws.update(values=[[", ".join(_fix_cell(stocks))]],
-                      range_name=gspread.utils.rowcol_to_a1(i, col + 1), value_input_option="USER_ENTERED")
-            n += 1
-        if n:
-            report.append(f"{cfg.label}:{n} 列")
+    moved_concepts = moved_news = 0
+    try:
+        old_concepts = nt.get_stock_concepts(oldpage["id"])
+        if old_concepts:
+            nt.link_stock_concepts(newpage["id"], old_concepts)
+            moved_concepts = len(old_concepts)
+        for nid in nt.stock_news_ids(oldpage["id"]):
+            try:
+                nt.replace_event_stock(nid, oldpage["id"], newpage["id"])
+                moved_news += 1
+            except nt.NotionError as e:
+                logger.warning("移轉新聞關聯失敗:%s", e)
+        nt.archive_page(oldpage["id"])
+    except nt.NotionError as e:
+        return Result("改股", f"⚠️ 併股途中失敗(可能已部分完成):{str(e)[:150]}")
 
-    if not report:
-        return Result("改股", f"⚠️ 所有分頁裡都沒有找到「{old}」")
-    return Result("改股", f"✅ 已把「{old}」全面更正為「{new}」:\n" + "\n".join("• " + x for x in report))
+    return Result("改股", f"✅ 已把「{oldpage['label']}」併到「{newpage['label']}」並封存舊頁\n"
+                          f"• 移轉概念 {moved_concepts} 個、新聞/時程 {moved_news} 筆")
 
 
 def _master_command(text: str) -> Result:
+    """概念↔個股修正(直接改 Notion 個股主表的「隸屬概念」與概念族群庫)。"""
     body = text.strip()[len("主表"):].strip()
     if not body:
         return Result("主表", _MASTER_HELP)
@@ -1430,133 +1407,154 @@ def _master_command(text: str) -> Result:
     action = parts[0]
     rest = parts[1].strip() if len(parts) > 1 else ""
 
-    ws = _get_worksheet(CONCEPT_MASTER_TAB, _CONCEPT_MASTER_HEADER)
-    rows = ws.get_all_values()
-    now = _now_str()
+    nt = notion_timeline
+    if not nt.enabled():
+        return Result("主表", "⚠️ 尚未啟用 Notion:請先設定 NOTION_TOKEN。")
 
-    if action in ("加", "新增", "加入"):
-        concept, stocklist = _split_colon(rest)
-        stocks = _split_list(stocklist)
-        if not concept or not stocks:
-            return Result("主表", "用法:主表 加 <概念>:<個股>\n例:主表 加 CPO:6442 光聖")
-        ridx, r = _find_concept_row(rows, concept)
-        if ridx:
-            cur = _split_list(r[1]) if len(r) > 1 else []
-            added = [s for s in stocks if not any(_stock_key(s) == _stock_key(x) for x in cur)]
-            merged = cur + added
-            first = r[3] if (len(r) > 3 and r[3].strip()) else now
-            ws.update(values=[[r[0].strip(), ", ".join(merged), len(merged), first, now]],
-                      range_name=f"A{ridx}:E{ridx}", value_input_option="USER_ENTERED")
-            return Result("主表", f"✅ 【{r[0].strip()}】加入:{', '.join(added) or '(已存在,無新增)'}\n"
-                                   f"現有({len(merged)}檔):{', '.join(merged)}")
-        ws.append_row([concept, ", ".join(stocks), len(stocks), now, now], value_input_option="USER_ENTERED")
-        return Result("主表", f"✅ 新增概念【{concept}】({len(stocks)}檔):{', '.join(stocks)}")
+    try:
+        if action in ("加", "新增", "加入"):
+            concept, stocklist = _split_colon(rest)
+            stocks = _split_list(stocklist)
+            if not concept or not stocks:
+                return Result("主表", "用法:主表 加 <概念>:<個股>\n例:主表 加 CPO:6442 光聖")
+            cid = nt.find_or_create_concept(concept)
+            linked, created = [], []
+            for s in stocks:
+                sp = nt.find_stock_page("", s)
+                if not sp:
+                    sp = nt.create_stock_page("", s)
+                    created.append(sp["label"])
+                nt.link_stock_concepts(sp["id"], [cid])
+                linked.append(sp["label"])
+            msg = f"✅ 已把概念【{concept}】掛到:{', '.join(linked)}"
+            if created:
+                msg += f"\n🆕 順便新增個股:{', '.join(created)}"
+            return Result("主表", msg)
 
-    if action in ("移除", "刪股", "移除個股"):
-        concept, stock = _split_colon(rest)
-        if not concept or not stock:
-            return Result("主表", "用法:主表 移除 <概念>:<個股>\n例:主表 移除 光通訊:2330")
-        ridx, r = _find_concept_row(rows, concept)
-        if not ridx:
-            return Result("主表", f"⚠️ 找不到概念【{concept}】")
-        cur = _split_list(r[1]) if len(r) > 1 else []
-        kept = [x for x in cur if _stock_key(x) != _stock_key(stock)]
-        if len(kept) == len(cur):
-            return Result("主表", f"⚠️ 【{concept}】裡沒有找到「{stock}」")
-        if kept:
-            first = r[3] if (len(r) > 3 and r[3].strip()) else now
-            ws.update(values=[[r[0].strip(), ", ".join(kept), len(kept), first, now]],
-                      range_name=f"A{ridx}:E{ridx}", value_input_option="USER_ENTERED")
-            return Result("主表", f"✅ 已從【{concept}】移除「{stock}」;剩 {len(kept)} 檔:{', '.join(kept)}")
-        ws.delete_rows(ridx)
-        return Result("主表", f"✅ 已從【{concept}】移除「{stock}」;該概念已無成分股,整列刪除")
+        if action in ("移除", "刪股", "移除個股"):
+            concept, stock = _split_colon(rest)
+            if not concept or not stock:
+                return Result("主表", "用法:主表 移除 <概念>:<個股>\n例:主表 移除 光通訊:2330")
+            c = nt.find_concept(concept)
+            if not c:
+                return Result("主表", f"⚠️ 找不到概念【{concept}】")
+            sp = nt.find_stock_page("", stock)
+            if not sp:
+                return Result("主表", f"⚠️ 找不到個股「{stock}」")
+            if not nt.unlink_stock_concept(sp["id"], c["id"]):
+                return Result("主表", f"⚠️「{sp['label']}」原本就沒有概念【{c['name']}】")
+            return Result("主表", f"✅ 已把「{sp['label']}」從概念【{c['name']}】移除")
 
-    if action in ("移除股", "全移除"):
-        stock = rest.strip()
-        if not stock:
-            return Result("主表", "用法:主表 移除股 <個股>\n例:主表 移除股 8111")
-        touched = []
-        for i, r in enumerate(rows[1:], start=2):
-            if not r or not r[0].strip():
-                continue
-            cur = _split_list(r[1]) if len(r) > 1 else []
-            kept = [x for x in cur if _stock_key(x) != _stock_key(stock)]
-            if len(kept) != len(cur):
-                touched.append((i, r[0].strip(), kept, r[3] if len(r) > 3 else now))
-        if not touched:
-            return Result("主表", f"⚠️ 所有概念裡都沒有找到「{stock}」")
-        # 由下往上寫/刪,避免刪列後列號位移
-        for i, cname, kept, first in sorted(touched, key=lambda t: -t[0]):
-            if kept:
-                ws.update(values=[[cname, ", ".join(kept), len(kept), first or now, now]],
-                          range_name=f"A{i}:E{i}", value_input_option="USER_ENTERED")
-            else:
-                ws.delete_rows(i)
-        return Result("主表", f"✅ 已從 {len(touched)} 個概念移除「{stock}」:{', '.join(t[1] for t in touched)}")
+        if action in ("移除股", "全移除"):
+            stock = rest.strip()
+            if not stock:
+                return Result("主表", "用法:主表 移除股 <個股>\n例:主表 移除股 8111")
+            sp = nt.find_stock_page("", stock)
+            if not sp:
+                return Result("主表", f"⚠️ 找不到個股「{stock}」")
+            n = len(nt.get_stock_concepts(sp["id"]))
+            if n == 0:
+                return Result("主表", f"⚠️「{sp['label']}」原本就沒有任何隸屬概念")
+            nt.set_stock_concepts(sp["id"], [])
+            return Result("主表", f"✅ 已清掉「{sp['label']}」的所有隸屬概念(原 {n} 個)")
 
-    if action in ("改股", "換股", "更正股", "改代號"):
-        old, new = _split_colon(rest)
-        if not old or not new:
-            return Result("主表", "用法:主表 改股 <舊>:<新>\n例:主表 改股 8111:6442 光聖")
-        oldkey = _stock_key(old)
-        touched = []
-        for i, r in enumerate(rows[1:], start=2):
-            if not r or not r[0].strip():
-                continue
-            cur = _split_list(r[1]) if len(r) > 1 else []
-            if not any(_stock_key(x) == oldkey for x in cur):
-                continue
-            newlist = []
-            for x in cur:
-                x2 = new if _stock_key(x) == oldkey else x
-                if not any(_stock_key(x2) == _stock_key(y) for y in newlist):
-                    newlist.append(x2)
-            first = r[3] if (len(r) > 3 and r[3].strip()) else now
-            touched.append((i, r[0].strip(), newlist, first))
-        if not touched:
-            return Result("主表", f"⚠️ 主表裡沒有任何概念含「{old}」")
-        for i, cname, newlist, first in touched:
-            ws.update(values=[[cname, ", ".join(newlist), len(newlist), first, now]],
-                      range_name=f"A{i}:E{i}", value_input_option="USER_ENTERED")
-        return Result("主表", f"✅ 已把「{old}」更正為「{new}」,更新 {len(touched)} 個概念:"
-                              f"{', '.join(t[1] for t in touched)}")
+        if action in ("改股", "換股", "更正股", "改代號"):
+            old, new = _split_colon(rest)
+            if not old or not new:
+                return Result("主表", "用法:主表 改股 <舊>:<新>\n例:主表 改股 8111:6442 光聖")
+            return _merge_stock(old, new)
 
-    if action in ("合併", "併入", "改名"):
-        a, b = _split_colon(rest)
-        if not a or not b:
-            return Result("主表", "用法:主表 合併 <概念A>:<概念B>(A 併入 B)\n例:主表 合併 共同封裝光學:CPO")
-        ra, rowa = _find_concept_row(rows, a)
-        if not ra:
-            return Result("主表", f"⚠️ 找不到來源概念【{a}】")
-        astocks = _split_list(rowa[1]) if len(rowa) > 1 else []
-        afirst = rowa[3] if len(rowa) > 3 else now
-        rb, rowb = _find_concept_row(rows, b)
-        if rb:
-            bstocks = _split_list(rowb[1]) if len(rowb) > 1 else []
-            added = [s for s in astocks if not any(_stock_key(s) == _stock_key(x) for x in bstocks)]
-            merged = bstocks + added
-            bfirst = rowb[3] if (len(rowb) > 3 and rowb[3].strip()) else now
-            first = min(x for x in (bfirst, afirst) if x) if (bfirst or afirst) else now
-            ws.update(values=[[rowb[0].strip(), ", ".join(merged), len(merged), first, now]],
-                      range_name=f"A{rb}:E{rb}", value_input_option="USER_ENTERED")
-            ws.delete_rows(ra)
-            return Result("主表", f"✅ 已把【{a}】併入【{rowb[0].strip()}】,共 {len(merged)} 檔:{', '.join(merged)}")
-        ws.update(values=[[b]], range_name=f"A{ra}", value_input_option="USER_ENTERED")
-        return Result("主表", f"✅ 已把概念【{a}】改名為【{b}】")
+        if action in ("合併", "併入", "改名"):
+            a, b = _split_colon(rest)
+            if not a or not b:
+                return Result("主表", "用法:主表 合併 <概念A>:<概念B>(A 併入 B)\n例:主表 合併 共同封裝光學:CPO")
+            ca = nt.find_concept(a)
+            if not ca:
+                return Result("主表", f"⚠️ 找不到來源概念【{a}】")
+            cb = nt.find_concept(b)
+            if not cb:
+                nt.rename_concept(ca["id"], b)
+                return Result("主表", f"✅ 已把概念【{a}】改名為【{b}】")
+            members = nt.concept_member_ids(ca["id"])
+            for sid in members:
+                try:
+                    nt.link_stock_concepts(sid, [cb["id"]])
+                except nt.NotionError as e:
+                    logger.warning("合併掛概念失敗:%s", e)
+            nt.archive_page(ca["id"])
+            return Result("主表", f"✅ 已把【{a}】({len(members)}檔)併入【{cb['name']}】並封存來源概念")
 
-    if action in ("刪除", "刪", "刪概念"):
-        concept = rest.strip()
-        ridx, r = _find_concept_row(rows, concept)
-        if not ridx:
-            return Result("主表", f"⚠️ 找不到概念【{concept}】")
-        n_stock = len(_split_list(r[1])) if len(r) > 1 else 0
-        ws.delete_rows(ridx)
-        return Result("主表", f"✅ 已刪除概念【{r[0].strip()}】(原 {n_stock} 檔)")
+        if action in ("刪除", "刪", "刪概念"):
+            concept = rest.strip()
+            c = nt.find_concept(concept)
+            if not c:
+                return Result("主表", f"⚠️ 找不到概念【{concept}】")
+            n = len(nt.concept_member_ids(c["id"]))
+            nt.archive_page(c["id"])
+            return Result("主表", f"✅ 已刪除(封存)概念【{c['name']}】(原 {n} 檔;各股的隸屬概念會自動移除)")
+    except nt.NotionError as e:
+        return Result("主表", f"⚠️ Notion 操作失敗:{str(e)[:180]}")
 
     return Result("主表", f"❓ 不認得的動作「{action}」。\n\n{_MASTER_HELP}")
 
 
+# 欄位詞 → (Notion 屬性, 型別);依分類群組
+_EDIT_FIELD_MAP = {
+    "timeline": [  # 個股新聞 / 產業新聞 / 個股產業報告(都在新聞與時程動態庫)
+        (("標題", "題目", "名稱"), "Name", "title"),
+        (("摘要", "內容", "備註", "筆記", "總結", "重點"), "Quick Note", "rich_text"),
+        (("日期", "時間"), "關鍵日期", "date"),
+        (("連結", "網址", "來源"), "來源連結", "url"),
+        (("狀態",), "狀態", "select"),
+        (("類型",), "事件類型", "select"),
+    ],
+    "global": [
+        (("標題", "題目", "名稱"), "Name", "title"),
+        (("摘要", "內容"), "AI 摘要", "rich_text"),
+        (("主題",), "影響主題", "multi_select"),
+        (("市場", "資產"), "受影響市場資產", "multi_select"),
+        (("日期", "時間"), "關鍵日期", "date"),
+        (("連結", "網址", "來源"), "來源連結", "url"),
+        (("狀態",), "狀態", "select"),
+    ],
+    "knowledge": [
+        (("標題", "主題", "題目", "名稱"), "Name", "title"),
+        (("重點", "內容", "整理"), "重點整理", "rich_text"),
+        (("關鍵字", "標籤"), "關鍵字", "multi_select"),
+        (("連結", "網址", "來源"), "來源連結", "url"),
+    ],
+}
+
+
+def _resolve_edit_field(field_word: str, group: str):
+    for words, prop, kind in _EDIT_FIELD_MAP[group]:
+        if any(w in field_word for w in words):
+            return prop, kind
+    return None, None
+
+
+def _build_edit_prop(kind: str, value: str):
+    """回傳 (Notion 屬性值 或 None, 錯誤訊息)。"""
+    if kind == "title":
+        return {"title": [{"text": {"content": value[:200]}}]}, ""
+    if kind == "rich_text":
+        return {"rich_text": [{"text": {"content": value[:1900]}}]}, ""
+    if kind == "url":
+        return {"url": value}, ""
+    if kind == "multi_select":
+        return {"multi_select": notion_timeline._multi_select(_split_list(value))}, ""
+    if kind == "date":
+        iso = _valid_iso(value)
+        if not iso:
+            return None, "日期格式需 YYYY-MM-DD,例如 2026-08-15"
+        return {"date": {"start": iso}}, ""
+    if kind == "select":
+        return {"select": {"name": value}}, ""
+    return None, "不支援的欄位型別"
+
+
 def _edit_row_command(text: str, prefix: str) -> Result:
+    """修改某一筆新聞的欄位(Notion)。找該分類最近一筆含關鍵字的記錄來改。"""
     body = text.strip()[len(prefix):].strip()
     left, value = _split_colon(body)
     toks = left.split()
@@ -1568,28 +1566,58 @@ def _edit_row_command(text: str, prefix: str) -> Result:
     if not cfg:
         return Result("修改", f"⚠️ 認不得分類「{cat_word}」。可用:個股新聞 / 產業新聞 / 產業報告 / 全球局勢 / 知識")
 
-    ws = _get_worksheet(cfg.tab, cfg.header)
-    rows = ws.get_all_values()
-    if len(rows) <= 1:
-        return Result("修改", f"⚠️ 【{cfg.label}】還沒有資料。")
-    header = rows[0]
-    col_idx = next((i for i, h in enumerate(header) if field_word in h), None)
-    if col_idx is None:
-        return Result("修改", f"⚠️ 找不到欄位「{field_word}」。\n可用欄位:{', '.join(header)}")
+    nt = notion_timeline
+    if not nt.enabled():
+        return Result("修改", "⚠️ 尚未啟用 Notion:請先設定 NOTION_TOKEN。")
 
-    target_i, target_row = None, None
-    for i in range(len(rows) - 1, 0, -1):  # 由最新往回找
-        if all(k in " ".join(rows[i]) for k in keywords):
-            target_i, target_row = i + 1, rows[i]
+    # 目標庫 + 事件類型過濾 + 欄位群
+    if cfg.label in ("個股新聞", "產業新聞", "產業報告"):
+        ds = nt.TIMELINE_DS
+        et = {"個股新聞": "個股新聞", "產業新聞": "產業新聞", "產業報告": "個股產業報告"}[cfg.label]
+        group = "timeline"
+    elif cfg.label == "全球局勢":
+        ds, et, group = nt.GLOBAL_DS, None, "global"
+    else:  # 知識
+        ds, et, group = nt.KNOWLEDGE_DS, None, "knowledge"
+
+    # 產業報告細項收在內文,無法單獨改
+    if cfg.label == "產業報告" and any(w in field_word for w in ("目標價", "券商", "營收", "利多", "利空")):
+        return Result("修改", "ℹ️ 產業報告的目標價/券商/營收等細項現在收在「內容(Quick Note)」裡,無法單獨改。\n"
+                              "請用「改 產業報告 <關鍵字> 內容:<新內容>」整段更新,或直接到 Notion 編輯。")
+
+    prop, kind = _resolve_edit_field(field_word, group)
+    if not prop:
+        avail = "、".join(p for _, p, _ in _EDIT_FIELD_MAP[group])
+        return Result("修改", f"⚠️ 找不到欄位「{field_word}」。\n可改欄位:{avail}")
+
+    propval, err = _build_edit_prop(kind, value)
+    if err:
+        return Result("修改", f"⚠️ {err}")
+
+    try:
+        pages = nt.recent_pages(ds, 100)
+    except nt.NotionError as e:
+        return Result("修改", f"⚠️ 讀取失敗:{str(e)[:150]}")
+
+    target = None
+    for pg in pages:  # 已新到舊
+        if et:
+            sel = (pg["properties"].get("事件類型", {}) or {}).get("select") or {}
+            if sel.get("name") != et:
+                continue
+        if all(k in nt.page_to_text(pg) for k in keywords):
+            target = pg
             break
-    if target_i is None:
-        return Result("修改", f"⚠️ 在【{cfg.label}】找不到含「{' '.join(keywords)}」的資料列。")
+    if not target:
+        return Result("修改", f"⚠️ 在【{cfg.label}】找不到含「{' '.join(keywords)}」的記錄。")
 
-    old = target_row[col_idx] if col_idx < len(target_row) else ""
-    a1 = gspread.utils.rowcol_to_a1(target_i, col_idx + 1)
-    ws.update(values=[[value]], range_name=a1, value_input_option="USER_ENTERED")
-    return Result("修改", f"✅ 已更新【{cfg.label}】第 {target_i} 列「{header[col_idx]}」:\n"
-                          f"{old or '(空)'} → {value}")
+    old = nt._prop_to_text(target["properties"].get(prop, {}))
+    name = nt._prop_to_text(target["properties"].get("Name", {}))
+    try:
+        nt.set_page_props(target["id"], {prop: propval})
+    except nt.NotionError as e:
+        return Result("修改", f"⚠️ 更新失敗(可能是選項值不合法):{str(e)[:150]}")
+    return Result("修改", f"✅ 已更新【{cfg.label}】「{name}」的「{prop}」:\n{old or '(空)'} → {value}")
 
 
 # ==========================================================

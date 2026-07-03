@@ -436,3 +436,71 @@ def page_to_text(page: dict, id_name_map: dict | None = None, skip=("💡 自動
         if val:
             parts.append(f"{name}:{val}")
     return " | ".join(parts)
+
+
+# ==========================================================
+# 修正指令用:概念/個股關聯的讀寫、頁面封存
+# ==========================================================
+def archive_page(page_id: str) -> None:
+    _patch(f"/pages/{page_id}", {"archived": True})
+
+
+def set_page_props(page_id: str, props: dict) -> None:
+    _patch(f"/pages/{page_id}", {"properties": props})
+
+
+def find_concept(name: str):
+    """精確找概念頁(不建立)。回傳 {'id','name'} 或 None。"""
+    name = (name or "").strip()
+    if not name:
+        return None
+    data = _post(
+        f"/data_sources/{CONCEPT_DS}/query",
+        {"filter": {"property": "Name", "title": {"equals": name}}, "page_size": 1},
+    )
+    r = data.get("results", [])
+    if not r:
+        return None
+    title = r[0].get("properties", {}).get("Name", {}).get("title", [])
+    return {"id": r[0]["id"], "name": "".join(t.get("plain_text", "") for t in title).strip()}
+
+
+def rename_concept(concept_id: str, new_name: str) -> None:
+    _patch(f"/pages/{concept_id}", {"properties": {"Name": {"title": [{"text": {"content": new_name[:200]}}]}}})
+    _concept_cache.clear()  # 名稱→id 快取可能過期
+
+
+def _relation_ids(page: dict, prop_name: str) -> list:
+    return [r["id"] for r in page.get("properties", {}).get(prop_name, {}).get("relation", []) if r.get("id")]
+
+
+def concept_member_ids(concept_id: str) -> list:
+    return _relation_ids(_get(f"/pages/{concept_id}"), "🔗 成員個股")
+
+
+def get_stock_concepts(stock_id: str) -> list:
+    return _relation_ids(_get(f"/pages/{stock_id}"), "🔗 隸屬概念")
+
+
+def set_stock_concepts(stock_id: str, ids: list) -> None:
+    _patch(f"/pages/{stock_id}", {"properties": {"🔗 隸屬概念": {"relation": [{"id": i} for i in _dedup(ids)]}}})
+
+
+def unlink_stock_concept(stock_id: str, concept_id: str) -> bool:
+    cur = get_stock_concepts(stock_id)
+    kept = [i for i in cur if i != concept_id]
+    if len(kept) == len(cur):
+        return False
+    set_stock_concepts(stock_id, kept)
+    return True
+
+
+def stock_news_ids(stock_id: str) -> list:
+    return _relation_ids(_get(f"/pages/{stock_id}"), "🔗 相關新聞時程")
+
+
+def replace_event_stock(event_id: str, old_id: str, new_id: str) -> None:
+    """把某事件的「關聯個股」裡的 old_id 換成 new_id(去重)。"""
+    ids = _relation_ids(_get(f"/pages/{event_id}"), "🔗 關聯個股")
+    ids2 = _dedup([new_id if i == old_id else i for i in ids])
+    _patch(f"/pages/{event_id}", {"properties": {"🔗 關聯個股": {"relation": [{"id": i} for i in ids2]}}})
