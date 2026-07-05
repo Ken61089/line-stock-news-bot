@@ -101,8 +101,19 @@ def _reply_list_events(reply_token: str, user_id: str, text: str) -> None:
         _say(reply_token, user_id, reply)
 
 
+# ---- 背景執行「查重訊」查詢並回覆 ----
+def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
+    try:
+        reply = calendar_notify.run_alerts_query(text)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("查重訊失敗")
+        reply = f"❌ 查重訊失敗:{e}"
+    if reply:
+        _say(reply_token, user_id, reply)
+
+
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-07-05-mops-alerts"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-07-05-mops-query"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
@@ -141,6 +152,15 @@ def callback():
             if room_id:
                 lines.append(f"\n本聊天室 room id(推播目標請用這個):\n{room_id}")
             _say(reply_token, user_id, "\n".join(lines))
+            continue
+
+        # 「查重訊」查詢追蹤股已累積的重大訊息(某天/本週/區間):唯讀,群組與私訊都可用
+        if calendar_notify.is_alerts_query_command(text):
+            threading.Thread(
+                target=_reply_alerts_query,
+                args=(reply_token, user_id, text),
+                daemon=True,
+            ).start()
             continue
 
         # 「列出事件」查詢(本週/下週/指定日期):唯讀,群組與私訊都可用

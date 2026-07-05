@@ -41,7 +41,7 @@ TYPE_EMOJI = {
     "發行可轉債": "💵", "除權息": "💰", "增減資": "🔀", "營收公布": "📊",
     "財報公布": "📋", "財報利空/多": "⚠️", "擴廠進度": "🏭", "試產進度": "🧪",
     "量產進度": "🚀", "展覽/政策": "📰", "盤後隨筆": "📝", "每日關注": "👀",
-    "隨手筆記": "✏️", "經濟數據": "🏦", "其他": "📌",
+    "隨手筆記": "✏️", "經濟數據": "🏦", "重大訊息": "🚨", "其他": "📌",
 }
 DEFAULT_EMOJI = "📌"
 
@@ -234,8 +234,54 @@ def run_list_events(text: str) -> str | None:
         return None
     start, end, label = rng
     # 盯盤筆記不算行事曆事件,列表時排除
-    events = query_events(start, end, extra_exclude={"每日關注", "隨手筆記"})
+    events = query_events(start, end, extra_exclude={"每日關注", "隨手筆記", "重大訊息"})
     return format_event_list(events, start, end, label)
+
+
+# ---- 「查重訊」:查追蹤股已累積的重大訊息(某天/本週/下週/區間)----
+_ALERTS_QUERY_PREFIXES = ("查重訊", "重訊查詢", "查重大訊息", "查種訊")
+_ALERTS_USAGE = (
+    "🚨 查重訊用法:\n"
+    "• 查重訊本週 / 查重訊下週\n"
+    "• 查重訊 7/10(某天)\n"
+    "• 查重訊 7/10~7/15(區間)\n"
+    "(只累積本功能上線後、追蹤股的重大訊息)"
+)
+
+
+def is_alerts_query_command(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    return s.splitlines()[0].strip().startswith(_ALERTS_QUERY_PREFIXES)
+
+
+def run_alerts_query(text: str) -> str:
+    s = (text or "").strip()
+    first = s.splitlines()[0].strip() if s else ""
+    arg = first
+    for p in _ALERTS_QUERY_PREFIXES:
+        if first.startswith(p):
+            arg = first[len(p):].strip()
+            break
+    today = datetime.datetime.now(TW_TZ).date()
+    rng = _resolve_list_range(arg, today)  # 空=本週,也吃 下週/日期/區間
+    if rng is None:
+        return _ALERTS_USAGE
+    start, end, label = rng
+    events = sorted((e for e in query_events(start, end) if e["type"] == "重大訊息"),
+                    key=lambda e: e["start"])
+    if start == end:
+        head = f"🚨 {start.month}/{start.day} 追蹤股重大訊息"
+    else:
+        head = f"🚨 {label} 追蹤股重大訊息 {start.month}/{start.day}~{end.month}/{end.day}"
+    if not events:
+        return f"{head}\n\n(這段期間追蹤股沒有重大訊息)"
+    lines = [head, ""]
+    for e in events:
+        d = e["start"]
+        lines.append(f"• {d[5:]} {e['title']}")
+    return "\n".join(lines)
 
 
 def format_weekly(events: list[dict], start: datetime.date, end: datetime.date) -> str:
@@ -286,8 +332,8 @@ def format_notes(notes: list[dict], day: datetime.date) -> str:
 # ---- 排程任務 ----
 def notify_daily(dry_run: bool = False) -> str | None:
     today = datetime.datetime.now(TW_TZ).date()
-    # 隨手筆記只在 21:00 彙整,不在早上出現
-    events = query_events(today, today, extra_exclude={"隨手筆記"})
+    # 隨手筆記只在 21:00 彙整、重大訊息只在「查重訊」看,都不在早上出現
+    events = query_events(today, today, extra_exclude={"隨手筆記", "重大訊息"})
 
     # 法說會提前預告:未來 1~EARNINGS_LEAD_DAYS 天內的法說會(僅預告類型)
     preview = []
@@ -314,7 +360,7 @@ def notify_tomorrow(dry_run: bool = False) -> str | None:
     today = datetime.datetime.now(TW_TZ).date()
     tomorrow = today + datetime.timedelta(days=1)
     # 明日事件(排除盯盤筆記與隨手筆記);今日隨筆另段彙整
-    events = query_events(tomorrow, tomorrow, extra_exclude={"每日關注", "隨手筆記"})
+    events = query_events(tomorrow, tomorrow, extra_exclude={"每日關注", "隨手筆記", "重大訊息"})
     notes = nt.list_notes_by_date(today.isoformat(), "隨手筆記")
     if not events and not notes:
         logger.info("明日(%s)無事件、今日無隨筆,不推播。", tomorrow)
@@ -335,7 +381,7 @@ def notify_weekly(dry_run: bool = False) -> str | None:
     next_mon = today + datetime.timedelta(days=(7 - today.weekday()))
     next_sun = next_mon + datetime.timedelta(days=6)
     # 週報只放真實行事曆事件,不含盯盤筆記/隨手筆記
-    events = query_events(next_mon, next_sun, extra_exclude={"每日關注", "隨手筆記"})
+    events = query_events(next_mon, next_sun, extra_exclude={"每日關注", "隨手筆記", "重大訊息"})
     msg = format_weekly(events, next_mon, next_sun)
     if dry_run:
         return msg

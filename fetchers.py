@@ -414,15 +414,40 @@ def check_mops_alerts() -> dict:
     if not fresh:
         return {"total": len(rows), "new": 0, "hits": 0}
 
-    codes = {s["code"] for s in nt.list_stocks() if s["code"]}
-    hits = [r for r in fresh if r["code"] in codes]
+    by_code = {s["code"]: s for s in nt.list_stocks() if s["code"]}
+    hits = [r for r in fresh if r["code"] in by_code]
     if hits:
         lines = ["🚨 重大訊息(追蹤股)"]
         for r in hits:
             lines.append(f"\n{r['code']} {r['name']}  {r['time']}\n{r['subject'][:180]}")
         _push_line("\n".join(lines))
+        # 同時存進 Notion(事件類型「重大訊息」)→ 之後可用「查重訊」查區間
+        for r in hits:
+            st = by_code[r["code"]]
+            try:
+                nt.add_event(
+                    title=f"{r['code']} {r['name']} {r['subject'][:60]}",
+                    date_start=_roc_to_iso(r["date"]),
+                    event_type="重大訊息",
+                    stock_page_id=st["id"],
+                    concept_ids=st["concept_ids"],
+                    note=f"{r['time']}｜{r['subject']}"[:1900],
+                    source="自動抓取",
+                    status="已發生",
+                )
+            except nt.NotionError as e:
+                logger.warning("寫入重大訊息失敗(%s):%s", r["code"], e)
     logger.info("MOPS 重訊:新 %d 則,命中追蹤股 %d 則", len(fresh), len(hits))
     return {"total": len(rows), "new": len(fresh), "hits": len(hits)}
+
+
+def _roc_to_iso(roc: str) -> str:
+    """民國日期 115/07/05 → 西元 2026-07-05。"""
+    try:
+        y, m, d = roc.split("/")
+        return f"{int(y) + 1911}-{int(m):02d}-{int(d):02d}"
+    except (ValueError, AttributeError):
+        return datetime.datetime.now(TW_TZ).date().isoformat()
 
 
 if __name__ == "__main__":
