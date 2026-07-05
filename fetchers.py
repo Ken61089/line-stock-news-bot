@@ -346,6 +346,85 @@ def sync_econ_events(dry_run: bool = False) -> dict:
     return {"found": len(rows), "added": added, "skipped": skipped, "added_items": items}
 
 
+# ==========================================================
+# MOPS 即時重大訊息監看 → 追蹤股命中就 LINE 警示
+# ==========================================================
+MOPS_URL = "https://mopsov.twse.com.tw/mops/web/t05sr01_1"
+_MOPS_ROW_RE = re.compile(
+    r"<td[^>]*>(\d{3,6})</td>\s*<td[^>]*>([^<]+)</td>\s*"
+    r"<td[^>]*>(\d{3}/\d{2}/\d{2})</td>\s*<td[^>]*>([\d:]+)</td>\s*"
+    r"<td[^>]*>([^<]*)</td>\s*<td>\s*<input[^>]*?skey\.value='([^']+)'",
+    re.S,
+)
+_mops_seen: set = set()
+_mops_baselined = False
+
+
+def fetch_mops_announcements() -> list[dict]:
+    """抓 MOPS 即時重大訊息(今天全部公司),回傳 [{code,name,date,time,subject,skey}]。"""
+    r = httpx.get(MOPS_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
+    r.raise_for_status()
+    html = r.content.decode("utf-8", "ignore")
+    out = []
+    for code, name, date, tm, subj, skey in _MOPS_ROW_RE.findall(html):
+        out.append({
+            "code": code.strip(),
+            "name": re.sub(r"\s+", "", name).strip(),
+            "date": date.strip(),
+            "time": tm.strip(),
+            "subject": re.sub(r"\s+", " ", subj).strip(),
+            "skey": skey.strip(),
+        })
+    return out
+
+
+def _push_line(text: str) -> None:
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+    target = os.environ.get("LINE_NOTIFY_TARGET_ID", "").strip()
+    if not (token and target):
+        logger.warning("未設定 LINE token/target,略過重訊警示推播")
+        return
+    resp = httpx.post(
+        "https://api.line.me/v2/bot/message/push",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"to": target, "messages": [{"type": "text", "text": text[:4900]}]},
+        timeout=20,
+    )
+    if resp.status_code >= 300:
+        logger.warning("重訊警示推播失敗 %s: %s", resp.status_code, resp.text[:200])
+
+
+def check_mops_alerts() -> dict:
+    """輪詢 MOPS 即時重訊:第一次建基準(不推),之後只對「新出現且屬追蹤股」的重訊推警示。
+    回傳 {'total','new','hits'}。"""
+    global _mops_baselined
+    rows = fetch_mops_announcements()
+    fresh = [r for r in rows if r["skey"] not in _mops_seen]
+    for r in rows:
+        _mops_seen.add(r["skey"])
+    if len(_mops_seen) > 5000:  # 界線,避免長跑無限膨脹(skey 每天重置)
+        _mops_seen.clear()
+        _mops_seen.update(r["skey"] for r in rows)
+
+    if not _mops_baselined:
+        _mops_baselined = True
+        logger.info("MOPS 重訊基準建立(%d 則),之後只推新的", len(rows))
+        return {"total": len(rows), "new": 0, "hits": 0}
+
+    if not fresh:
+        return {"total": len(rows), "new": 0, "hits": 0}
+
+    codes = {s["code"] for s in nt.list_stocks() if s["code"]}
+    hits = [r for r in fresh if r["code"] in codes]
+    if hits:
+        lines = ["🚨 重大訊息(追蹤股)"]
+        for r in hits:
+            lines.append(f"\n{r['code']} {r['name']}  {r['time']}\n{r['subject'][:180]}")
+        _push_line("\n".join(lines))
+    logger.info("MOPS 重訊:新 %d 則,命中追蹤股 %d 則", len(fresh), len(hits))
+    return {"total": len(rows), "new": len(fresh), "hits": len(hits)}
+
+
 if __name__ == "__main__":
     import sys
 

@@ -407,6 +407,15 @@ def maybe_start_scheduler() -> None:
                 id="fetch_econ", replace_existing=True,
             )
             fetch_log += f"、每日 {e_h:02d}:{e_m:02d} 抓美國經濟事件"
+        # 全天每 30 分鐘監看 MOPS 即時重大訊息,追蹤股命中就推警示(06:00~23:30)
+        mops_min = os.environ.get("MOPS_CHECK_MINUTES", "0,30")
+        mops_hours = os.environ.get("MOPS_CHECK_HOURS", "6-23")
+        sched.add_job(
+            _safe(fetchers.check_mops_alerts),
+            CronTrigger(hour=mops_hours, minute=mops_min, timezone=tz),
+            id="mops_alerts", replace_existing=True,
+        )
+        fetch_log += "、每 30 分監看重大訊息"
     except Exception:  # noqa: BLE001
         logger.exception("fetchers 掛載失敗,法說會自動抓取不啟用")
         fetch_log = ""
