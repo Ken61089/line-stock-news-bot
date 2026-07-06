@@ -217,8 +217,13 @@ def read_ai_usage_month(month: str) -> dict | None:
 
 
 def write_ai_usage_month(month, calls, prompt, completion, cost, page_id=None) -> str:
-    """把某月累計「絕對值」寫回 Notion(有 page_id 就更新,沒有就新建)。回頁 id。"""
+    """把某月累計「絕對值」寫回 Notion(有 page_id 就更新,沒有就新建)。回頁 id。
+    沒帶 page_id 時先查該月是否已有列(upsert),避免重啟後對同一月建出重複列。"""
     now = datetime.datetime.now(TW_TZ).isoformat(timespec="seconds")
+    if not page_id:  # 冪等:同月已存在就改它,不新建
+        existing = read_ai_usage_month(month)
+        if existing:
+            page_id = existing["page_id"]
     props = {
         "月份": {"title": [{"text": {"content": month}}]},
         "呼叫次數": {"number": int(calls)},
