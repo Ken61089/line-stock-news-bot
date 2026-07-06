@@ -24,6 +24,8 @@ STOCK_DS = os.environ.get("NOTION_STOCK_DS", "388da86b-7f8b-817c-93ca-000b5553ac
 CONCEPT_DS = os.environ.get("NOTION_CONCEPT_DS", "388da86b-7f8b-8177-8d81-000badfe5200").strip()
 GLOBAL_DS = os.environ.get("NOTION_GLOBAL_DS", "36694cc2-76ec-469e-9e78-1d0df333d79a").strip()
 KNOWLEDGE_DS = os.environ.get("NOTION_KNOWLEDGE_DS", "517dd7f8-6804-4048-bd0c-529a8cbe8b1a").strip()
+# AI 用量統計庫(一月一列,持久化 AI token 用量;2026-07-06 建於股票大腦母頁下)
+AI_USAGE_DS = os.environ.get("NOTION_AI_USAGE_DS", "71bdc5e1-59f0-424b-acec-4ad47076861c").strip()
 
 _API = "https://api.notion.com/v1"
 _STOCK_CODE_RE = re.compile(r"\d{3,6}")
@@ -183,6 +185,77 @@ def update_note(page_id: str, content: str) -> None:
             }
         },
     )
+
+
+# ==========================================================
+# AI 用量持久化(一月一列,跨部署/跨月累計)
+# ==========================================================
+def _usage_num(props: dict, name: str) -> int:
+    try:
+        return int(props.get(name, {}).get("number") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_ai_usage_month(month: str) -> dict | None:
+    """讀某月(YYYY-MM)那一列;回 {'page_id','calls','prompt','completion'} 或 None。"""
+    data = _post(
+        f"/data_sources/{AI_USAGE_DS}/query",
+        {"filter": {"property": "月份", "title": {"equals": month}}, "page_size": 1},
+    )
+    results = data.get("results", [])
+    if not results:
+        return None
+    pg = results[0]
+    p = pg.get("properties", {})
+    return {
+        "page_id": pg["id"],
+        "calls": _usage_num(p, "呼叫次數"),
+        "prompt": _usage_num(p, "Prompt Tokens"),
+        "completion": _usage_num(p, "Completion Tokens"),
+    }
+
+
+def write_ai_usage_month(month, calls, prompt, completion, cost, page_id=None) -> str:
+    """把某月累計「絕對值」寫回 Notion(有 page_id 就更新,沒有就新建)。回頁 id。"""
+    now = datetime.datetime.now(TW_TZ).isoformat(timespec="seconds")
+    props = {
+        "月份": {"title": [{"text": {"content": month}}]},
+        "呼叫次數": {"number": int(calls)},
+        "Prompt Tokens": {"number": int(prompt)},
+        "Completion Tokens": {"number": int(completion)},
+        "估算USD": {"number": round(float(cost), 4)},
+        "最後更新": {"rich_text": [{"text": {"content": now}}]},
+    }
+    if page_id:
+        _patch(f"/pages/{page_id}", {"properties": props})
+        return page_id
+    data = _post(
+        "/pages",
+        {"parent": {"type": "data_source_id", "data_source_id": AI_USAGE_DS}, "properties": props},
+    )
+    return data.get("id", "")
+
+
+def read_ai_usage_all() -> dict:
+    """加總所有月份;回 {'calls','prompt','completion','months'}。"""
+    calls = prompt = completion = months = 0
+    cursor = None
+    while True:
+        payload = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        data = _post(f"/data_sources/{AI_USAGE_DS}/query", payload)
+        for pg in data.get("results", []):
+            p = pg.get("properties", {})
+            calls += _usage_num(p, "呼叫次數")
+            prompt += _usage_num(p, "Prompt Tokens")
+            completion += _usage_num(p, "Completion Tokens")
+            months += 1
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return {"calls": calls, "prompt": prompt, "completion": completion, "months": months}
 
 
 def find_stock_page(code: str, name: str = "") -> dict | None:

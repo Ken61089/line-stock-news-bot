@@ -357,11 +357,14 @@ def run_usage() -> str:
             lines.append(f"週期至 {fu['period_end'][:10]}")
 
     au = news_processor.get_ai_usage()
-    lines += ["", "━ AI token(自本次部署起累計)━"]
-    lines.append(f"{au['calls']} 次・in {au['prompt_tokens']:,}・out {au['completion_tokens']:,}")
-    lines.append(f"估算 ~US${au['cost_usd']:.3f}(model {au['model']})")
-    lines.append(f"起算 {au['since'][:16].replace('T', ' ')}")
-    lines.append("\nℹ️ LINE/Firecrawl 為即時真實用量;AI 為機器人自計量,部署重啟會歸零。")
+    lines += ["", f"━ AI token(本月 {au['month']})━"]
+    lines.append(f"{au['month_calls']} 次・in {au['month_prompt']:,}・out {au['month_completion']:,}")
+    lines.append(f"估算 ~US${au['month_cost']:.3f}(model {au['model']})")
+    lines.append(f"累計 {au['all_months']} 個月:{au['all_calls']} 次・~US${au['all_cost']:.3f}")
+    if not au["persisted"]:
+        lines.append("⚠️ Notion 持久化讀取失敗,AI 數字僅記憶體暫存")
+
+    lines.append("\nℹ️ 三者皆真實用量;AI 用量持久化於 Notion,跨部署/跨月累計。")
     return "\n".join(lines)
 
 

@@ -10,6 +10,7 @@
 import os
 import re
 import json
+import threading
 import datetime
 from dataclasses import dataclass
 from typing import List, Type, Callable
@@ -78,45 +79,97 @@ def _get_ai_client() -> OpenAI:
     return _openai_client
 
 
-# ---- AI token 自計量 ----
-# Zeabur AI Hub 的實際 token 花費靠回應自帶的 usage 累加(部署會重啟歸零,故記自哪時起算)。
-# Sonnet 4.5 單價(每百萬 token,美金);換模型可用 AI_PRICE_IN/OUT env 覆寫。
+# ---- AI token 自計量(持久化到 Notion,跨部署/跨月累計)----
+# 每次呼叫 AI 從回應的 usage 累加當月 token,write-through 寫回 Notion「AI 用量統計」庫
+# (一月一列)。開機時從 Notion 載回當月累計 → 部署重啟不歸零。Notion 掛了則退回純記憶體。
+# 單價(每百萬 token,美金),換模型用 AI_PRICE_IN/OUT env 覆寫(如 Haiku 記得改)。
 _AI_PRICE_IN = float(os.environ.get("AI_PRICE_IN", "3.0"))
 _AI_PRICE_OUT = float(os.environ.get("AI_PRICE_OUT", "15.0"))
-_AI_USAGE = {
-    "calls": 0,
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "since": datetime.datetime.now(TW_TZ).isoformat(timespec="seconds"),
-}
+_ai_lock = threading.Lock()
+_ai_state = {"month": "", "calls": 0, "prompt": 0, "completion": 0, "page_id": None, "loaded": False}
+
+
+def _current_month() -> str:
+    return datetime.datetime.now(TW_TZ).strftime("%Y-%m")
+
+
+def _month_cost(prompt: int, completion: int) -> float:
+    return prompt / 1_000_000 * _AI_PRICE_IN + completion / 1_000_000 * _AI_PRICE_OUT
+
+
+def _ensure_month_loaded() -> None:
+    """確保 _ai_state 是「當月」的累計;跨月或首次會從 Notion 載回(呼叫端須持鎖)。"""
+    m = _current_month()
+    if _ai_state["loaded"] and _ai_state["month"] == m:
+        return
+    _ai_state.update({"month": m, "calls": 0, "prompt": 0, "completion": 0, "page_id": None})
+    try:
+        if notion_timeline.enabled():
+            row = notion_timeline.read_ai_usage_month(m)
+            if row:
+                _ai_state.update({
+                    "calls": row["calls"], "prompt": row["prompt"],
+                    "completion": row["completion"], "page_id": row["page_id"],
+                })
+    except Exception as e:  # noqa: BLE001
+        logger.warning("讀取 AI 用量(Notion)失敗,改用記憶體:%s", e)
+    _ai_state["loaded"] = True
 
 
 def _ai_chat(**kwargs):
-    """呼叫 AI Hub 並累加 token 用量。用法同 client.chat.completions.create。"""
+    """呼叫 AI Hub 並把 token 用量累加到當月、write-through 寫回 Notion。用法同 create。"""
     completion = _get_ai_client().chat.completions.create(**kwargs)
     try:
         u = completion.usage
-        _AI_USAGE["calls"] += 1
-        _AI_USAGE["prompt_tokens"] += int(getattr(u, "prompt_tokens", 0) or 0)
-        _AI_USAGE["completion_tokens"] += int(getattr(u, "completion_tokens", 0) or 0)
+        dp = int(getattr(u, "prompt_tokens", 0) or 0)
+        dc = int(getattr(u, "completion_tokens", 0) or 0)
     except (AttributeError, TypeError, ValueError):
-        pass
+        return completion
+    with _ai_lock:
+        _ensure_month_loaded()
+        _ai_state["calls"] += 1
+        _ai_state["prompt"] += dp
+        _ai_state["completion"] += dc
+        try:  # write-through:計量失敗絕不影響 AI 主流程
+            if notion_timeline.enabled():
+                pid = notion_timeline.write_ai_usage_month(
+                    _ai_state["month"], _ai_state["calls"], _ai_state["prompt"],
+                    _ai_state["completion"],
+                    _month_cost(_ai_state["prompt"], _ai_state["completion"]),
+                    _ai_state["page_id"],
+                )
+                if pid:
+                    _ai_state["page_id"] = pid
+        except Exception as e:  # noqa: BLE001
+            logger.warning("寫入 AI 用量(Notion)失敗:%s", e)
     return completion
 
 
 def get_ai_usage() -> dict:
-    """回傳自本次部署起累加的 AI 用量與估算美金花費。"""
-    pin = _AI_USAGE["prompt_tokens"]
-    pout = _AI_USAGE["completion_tokens"]
-    cost = pin / 1_000_000 * _AI_PRICE_IN + pout / 1_000_000 * _AI_PRICE_OUT
+    """回傳當月累計 + 全部月份累計(讀 Notion)+ 估算美金。供「用量」報告用。"""
+    with _ai_lock:
+        _ensure_month_loaded()
+        month, mc, mp, mco = (
+            _ai_state["month"], _ai_state["calls"],
+            _ai_state["prompt"], _ai_state["completion"],
+        )
+    persisted = False
+    allc, allp, allco, months = mc, mp, mco, 1
+    try:
+        if notion_timeline.enabled():
+            s = notion_timeline.read_ai_usage_all()
+            allc, allp, allco, months = s["calls"], s["prompt"], s["completion"], s["months"]
+            persisted = True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("讀取 AI 累計(Notion)失敗:%s", e)
     return {
         "model": AI_MODEL,
-        "calls": _AI_USAGE["calls"],
-        "prompt_tokens": pin,
-        "completion_tokens": pout,
-        "total_tokens": pin + pout,
-        "cost_usd": cost,
-        "since": _AI_USAGE["since"],
+        "month": month,
+        "month_calls": mc, "month_prompt": mp, "month_completion": mco,
+        "month_cost": _month_cost(mp, mco),
+        "all_calls": allc, "all_prompt": allp, "all_completion": allco,
+        "all_cost": _month_cost(allp, allco), "all_months": months,
+        "persisted": persisted,
     }
 
 
