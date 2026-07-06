@@ -78,6 +78,48 @@ def _get_ai_client() -> OpenAI:
     return _openai_client
 
 
+# ---- AI token 自計量 ----
+# Zeabur AI Hub 的實際 token 花費靠回應自帶的 usage 累加(部署會重啟歸零,故記自哪時起算)。
+# Sonnet 4.5 單價(每百萬 token,美金);換模型可用 AI_PRICE_IN/OUT env 覆寫。
+_AI_PRICE_IN = float(os.environ.get("AI_PRICE_IN", "3.0"))
+_AI_PRICE_OUT = float(os.environ.get("AI_PRICE_OUT", "15.0"))
+_AI_USAGE = {
+    "calls": 0,
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "since": datetime.datetime.now(TW_TZ).isoformat(timespec="seconds"),
+}
+
+
+def _ai_chat(**kwargs):
+    """呼叫 AI Hub 並累加 token 用量。用法同 client.chat.completions.create。"""
+    completion = _get_ai_client().chat.completions.create(**kwargs)
+    try:
+        u = completion.usage
+        _AI_USAGE["calls"] += 1
+        _AI_USAGE["prompt_tokens"] += int(getattr(u, "prompt_tokens", 0) or 0)
+        _AI_USAGE["completion_tokens"] += int(getattr(u, "completion_tokens", 0) or 0)
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return completion
+
+
+def get_ai_usage() -> dict:
+    """回傳自本次部署起累加的 AI 用量與估算美金花費。"""
+    pin = _AI_USAGE["prompt_tokens"]
+    pout = _AI_USAGE["completion_tokens"]
+    cost = pin / 1_000_000 * _AI_PRICE_IN + pout / 1_000_000 * _AI_PRICE_OUT
+    return {
+        "model": AI_MODEL,
+        "calls": _AI_USAGE["calls"],
+        "prompt_tokens": pin,
+        "completion_tokens": pout,
+        "total_tokens": pin + pout,
+        "cost_usd": cost,
+        "since": _AI_USAGE["since"],
+    }
+
+
 # ==========================================================
 # 容錯:把 AI 可能回的物件/數字統一轉乾淨字串
 # ==========================================================
@@ -633,6 +675,9 @@ _HELP_TEXT = (
     "━━ 查重訊 ━━(唯讀,查追蹤股累積的重大訊息)\n"
     "• 查重訊本週  • 查重訊 7/10  • 查重訊 7/10~7/15\n"
     "\n"
+    "━━ 用量 ━━(唯讀,即時看成本)\n"
+    "• 打「用量」看 LINE 推播則數 / Firecrawl credit / AI token\n"
+    "\n"
     "━━ 法說會自動更新 ━━(每天自動抓,也可手動)\n"
     "• 打「更新法說會」→ 立即抓追蹤股的法說會進時程\n"
     "\n"
@@ -748,7 +793,7 @@ def _analyze(cfg: CategoryConfig, title: str, content: str):
     last_err = None
     for _ in range(2):
         try:
-            completion = _get_ai_client().chat.completions.create(
+            completion = _ai_chat(
                 model=AI_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -991,7 +1036,7 @@ def _parse_timeline(body: str) -> TimelineInput:
     last_err = None
     for _ in range(2):
         try:
-            completion = _get_ai_client().chat.completions.create(
+            completion = _ai_chat(
                 model=AI_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -1036,7 +1081,7 @@ def _parse_timeline_many(bodies: List[str]) -> List[TimelineInput]:
 """
     for _ in range(2):
         try:
-            completion = _get_ai_client().chat.completions.create(
+            completion = _ai_chat(
                 model=AI_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -1559,7 +1604,7 @@ def _answer_query(question: str) -> Result:
         f"以下是使用者 Notion 投資筆記資料庫(較新的在前):\n\n{corpus}\n\n"
         f"---\n使用者的問題:{question}\n\n請只根據上面的資料庫內容回答。"
     )
-    completion = _get_ai_client().chat.completions.create(
+    completion = _ai_chat(
         model=AI_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},

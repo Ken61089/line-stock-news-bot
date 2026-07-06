@@ -101,6 +101,16 @@ def _reply_list_events(reply_token: str, user_id: str, text: str) -> None:
         _say(reply_token, user_id, reply)
 
 
+# ---- 背景執行「用量」報告並回覆 ----
+def _reply_usage(reply_token: str, user_id: str, text: str) -> None:
+    try:
+        reply = calendar_notify.run_usage()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("用量報告失敗")
+        reply = f"❌ 用量報告失敗:{e}"
+    _say(reply_token, user_id, reply)
+
+
 # ---- 背景執行「查重訊」查詢並回覆 ----
 def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
     try:
@@ -113,7 +123,7 @@ def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-07-06-timeline-batch"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-07-06-usage-report"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
@@ -152,6 +162,15 @@ def callback():
             if room_id:
                 lines.append(f"\n本聊天室 room id(推播目標請用這個):\n{room_id}")
             _say(reply_token, user_id, "\n".join(lines))
+            continue
+
+        # 「用量」報告:LINE 推播則數 + Firecrawl credit + AI token 即時用量,唯讀
+        if calendar_notify.is_usage_command(text):
+            threading.Thread(
+                target=_reply_usage,
+                args=(reply_token, user_id, text),
+                daemon=True,
+            ).start()
             continue
 
         # 「查重訊」查詢追蹤股已累積的重大訊息(某天/本週/區間):唯讀,群組與私訊都可用

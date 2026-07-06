@@ -284,6 +284,87 @@ def run_alerts_query(text: str) -> str:
     return "\n".join(lines)
 
 
+# ---- 用量報告(真實數字):LINE 推播則數 / Firecrawl credit / AI token ----
+_USAGE_WORDS = {"用量", "用量報告", "查用量", "usage"}
+
+
+def is_usage_command(text: str) -> bool:
+    return (text or "").strip().lower() in _USAGE_WORDS
+
+
+def fetch_line_usage() -> dict:
+    """LINE 本月已用推播則數 / 上限。回 {'type','quota','used'} 或 {'error'}。"""
+    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+    if not token:
+        return {"error": "未設定 LINE_CHANNEL_ACCESS_TOKEN"}
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        q = httpx.get("https://api.line.me/v2/bot/message/quota",
+                      headers=headers, timeout=15).json()
+        c = httpx.get("https://api.line.me/v2/bot/message/quota/consumption",
+                      headers=headers, timeout=15).json()
+        return {"type": q.get("type", ""), "quota": q.get("value"), "used": c.get("totalUsage")}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:120]}
+
+
+def fetch_firecrawl_usage() -> dict:
+    """Firecrawl 本期 credit 用量。回 {'remaining','plan','period_end'} 或 {'error'}。"""
+    key = os.environ.get("FIRECRAWL_API_KEY", "").strip()
+    if not key:
+        return {"error": "未設定 FIRECRAWL_API_KEY"}
+    base = os.environ.get("FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/")
+    try:
+        r = httpx.get(f"{base}/v2/team/credit-usage",
+                      headers={"Authorization": f"Bearer {key}"}, timeout=15)
+        d = r.json().get("data", {}) or {}
+        return {"remaining": d.get("remainingCredits"), "plan": d.get("planCredits"),
+                "period_end": d.get("billingPeriodEnd", "")}
+    except Exception as e:  # noqa: BLE001
+        return {"error": str(e)[:120]}
+
+
+def run_usage() -> str:
+    """組出「用量報告」文字:LINE 推播則數 + Firecrawl credit + AI token(即時抓)。"""
+    import news_processor  # 延遲載入,避免模組層循環匯入
+    now = datetime.datetime.now(TW_TZ)
+    lines = [f"📊 用量報告 {now.month}/{now.day} {now.strftime('%H:%M')}"]
+
+    lu = fetch_line_usage()
+    lines += ["", "━ LINE 推播(本月)━"]
+    if lu.get("error"):
+        lines.append(f"⚠️ 讀取失敗:{lu['error']}")
+    elif lu.get("type") == "limited" and lu.get("quota"):
+        used, quota = lu.get("used") or 0, lu["quota"]
+        pct = round(used / quota * 100) if quota else 0
+        lines.append(f"已用 {used} / {quota} 則({pct}%)")
+    else:
+        lines.append(f"已用 {lu.get('used') or 0} 則(方案 {lu.get('type') or '未知'};免費版上限 200)")
+
+    fu = fetch_firecrawl_usage()
+    lines += ["", "━ Firecrawl credit(本期)━"]
+    if fu.get("error"):
+        lines.append(f"⚠️ 讀取失敗:{fu['error']}")
+    else:
+        rem, plan = fu.get("remaining"), fu.get("plan")
+        if plan and rem is not None:
+            lines.append(f"已用 {plan - rem:,} / {plan:,}(剩 {rem:,})")
+        elif rem is not None:
+            lines.append(f"剩餘 {rem:,} credits")
+        else:
+            lines.append("(無法解析回傳)")
+        if fu.get("period_end"):
+            lines.append(f"週期至 {fu['period_end'][:10]}")
+
+    au = news_processor.get_ai_usage()
+    lines += ["", "━ AI token(自本次部署起累計)━"]
+    lines.append(f"{au['calls']} 次・in {au['prompt_tokens']:,}・out {au['completion_tokens']:,}")
+    lines.append(f"估算 ~US${au['cost_usd']:.3f}(model {au['model']})")
+    lines.append(f"起算 {au['since'][:16].replace('T', ' ')}")
+    lines.append("\nℹ️ LINE/Firecrawl 為即時真實用量;AI 為機器人自計量,部署重啟會歸零。")
+    return "\n".join(lines)
+
+
 def format_weekly(events: list[dict], start: datetime.date, end: datetime.date) -> str:
     head = (
         f"🗓️ 下週投資行事曆\n"
