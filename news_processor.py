@@ -614,6 +614,7 @@ _HELP_TEXT = (
     "• 時程 8131福懋科 8月量產\n"
     "• 時程 2330 7/17 法說會\n"
     "• 時程 3583 擴廠 8月試產、11月量產\n"
+    "• 批次:第一行只打「時程」,之後一行一筆\n"
     "\n"
     "━━ 隔日盯盤 ━━(「關注」開頭,隔天 08:30 隨推播通知)\n"
     "• 關注 2330 台積電 站上季線再追\n"
@@ -956,7 +957,12 @@ _TIMELINE_USAGE = (
     "• 時程 8131福懋科 8月量產\n"
     "• 時程 2330 7/17 法說會\n"
     "• 時程 6442光聖 Q3 台北國際光電展\n"
-    "• 時程 3583 擴廠 8月試產、11月量產"
+    "• 時程 3583 擴廠 8月試產、11月量產\n"
+    "\n"
+    "批次(一次多檔):第一行只打「時程」,之後一行一筆:\n"
+    "時程\n"
+    "2330 台積電 法說會 7/16\n"
+    "3008 大立光 法說會 7/9"
 )
 
 
@@ -1000,36 +1006,74 @@ def _parse_timeline(body: str) -> TimelineInput:
     raise RuntimeError(f"AI 解析時程失敗(已重試):{last_err}")
 
 
-def _handle_timeline(text: str):
-    """開頭是「時程」前綴 → 寫進 Notion 時間軸並回覆;否則回傳 None。"""
-    s = text.strip()
-    first_line = s.splitlines()[0].strip() if s else ""
-    matched = next((p for p in _TIMELINE_PREFIXES if first_line.startswith(p)), None)
-    if matched is None:
-        return None
+def _parse_timeline_many(bodies: List[str]) -> List[TimelineInput]:
+    """用一次 AI 呼叫把多行時程各拆成結構化事件,回傳與輸入等長、順序對應的清單。
+    只有一行就走單筆解析;數量對不上或解析失敗時退回逐行解析,保證每行都有結果。"""
+    if len(bodies) == 1:
+        return [_parse_timeline(bodies[0])]
 
-    body = s[len(matched):].strip(" :：、,，.。\n")
-    if not body:
-        raise NoCategoryError(_TIMELINE_USAGE)
+    today = datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d")
+    numbered = "\n".join(f"{i + 1}. {b}" for i, b in enumerate(bodies))
+    system_prompt = (
+        "你是精準的台股時程資料結構化助手。只回傳合法 JSON,不寫任何說明,不要用 markdown 包起來。"
+    )
+    user_prompt = f"""請把下面【每一行】各拆成一筆「股票時程事件」,依原順序回傳。
 
-    if not notion_timeline.enabled():
-        raise NoCategoryError(
-            "⚠️ 時程功能尚未啟用:請先在環境變數設定 NOTION_TOKEN"
-            "(Notion integration 密鑰,並把「股票投資大腦」頁面分享給該 integration)。"
-        )
+【今天日期】{today}(台灣時間)
+【輸入(每行一筆,共 {len(bodies)} 筆)】
+{numbered}
 
-    data = _parse_timeline(body)
+每一筆的規則:
+- stock_code:台股代號(3-6 位數字),沒有就給空字串。
+- stock_name:個股名稱(去掉代號),沒有就空字串。
+- title:精簡事件標題(例如「Q2 法說會」「桃園三廠量產」「台北國際光電展」)。
+- date_start / date_end:一律 YYYY-MM-DD。只寫月份(如「8月」)用該月 1 日;只寫季(Q1~Q4)用該季首月 1 日;沒寫年份用「今天日期」推最近的合理年份(通常今年或明年,不要用過去)。單一時間點只填 date_start;有明確區間(如「8月試產、11月量產」)才填 date_end。
+- event_type:必須從這個清單挑最接近的一個:擴廠進度、試產進度、量產進度、發行可轉債、CB掛牌、CB拆解、法說會、股東會、除權息、增減資、營收公布、財報公布、財報利空/多、展覽/政策、其他。
+- note:原句裡的補充資訊(沒有就空字串)。
+
+嚴格回傳這個結構(events 陣列長度必須等於 {len(bodies)},順序對應每一行):
+{{"events":[{{"stock_code":"","stock_name":"","title":"","date_start":"","date_end":"","event_type":"","note":""}}]}}
+"""
+    for _ in range(2):
+        try:
+            completion = _get_ai_client().chat.completions.create(
+                model=AI_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=300 * len(bodies) + 300,
+            )
+            raw = completion.choices[0].message.content or ""
+            obj = _safe_json_loads(raw)
+            events = obj.get("events") if isinstance(obj, dict) else None
+            if isinstance(events, list) and len(events) == len(bodies):
+                return [TimelineInput.model_validate(e) for e in events]
+        except (json.JSONDecodeError, ValidationError, KeyError, TypeError, AttributeError):
+            pass
+    # 一次拆多筆失敗 → 退回逐行解析(較慢但保證每行有結果)
+    return [_parse_timeline(b) for b in bodies]
+
+
+class _TimelineItemError(Exception):
+    """單一筆時程解析/寫入的可回復錯誤(批次時記下該行、其餘照寫)。"""
+
+
+def _store_timeline_event(data: TimelineInput, body: str) -> dict:
+    """寫入一筆時程事件到 Notion。成功回傳含摘要欄位的 dict;
+    可回復錯誤(看不出日期)丟 _TimelineItemError,由呼叫端決定要略過或回提示。"""
     if not data.title:
         data.title = body[:60]
     if not data.date_start:
-        raise NoCategoryError(
-            f"🗓️ 我看不出「{body}」裡的日期。請補上時間,例如「8月量產」「7/17 法說會」「Q3」。"
+        raise _TimelineItemError(
+            f"看不出「{body}」裡的日期(請補上「8月量產」「7/17 法說會」「Q3」之類)"
         )
 
     # 找個股頁(用代號優先);找不到就自動新增到個股主表再關聯
     stock = None
     warn = ""
     auto_created = False
+    is_cb_unfiled = False
     try:
         stock = notion_timeline.find_stock_page(data.stock_code, data.stock_name)
     except notion_timeline.NotionError as e:
@@ -1045,6 +1089,7 @@ def _handle_timeline(text: str):
             except notion_timeline.NotionError as e:
                 logger.warning("自動新增個股失敗:%s", e)
         if stock is None and is_cb:
+            is_cb_unfiled = True
             warn = (
                 f"\nℹ️「{(data.stock_code + ' ' + data.stock_name).strip()}」為 5~6 碼(CB/非現股),"
                 "已建事件但未建檔到個股主表(只有一般四碼現股才自動建檔)。"
@@ -1081,21 +1126,105 @@ def _handle_timeline(text: str):
     )
 
     date_txt = data.date_start + (f" ~ {data.date_end}" if data.date_end else "")
-    linked = f"🔗 {stock['label']}" if stock else "(未關聯個股)"
-    n_concept = len(stock.get("concept_ids") or []) if stock else 0
-    concept_txt = f"（已自動歸類 {n_concept} 個概念）" if n_concept else ""
-    reply = (
-        "🗓️ 已寫入 Notion 時間軸\n"
-        f"• 事件:{event_title}\n"
-        f"• 日期:{date_txt}\n"
-        f"• 類型:{data.event_type or '其他'}\n"
-        f"• 個股:{linked}{concept_txt}"
-        + (f"\n• 備註:{data.note}" if data.note else "")
-        + warn
+    return {
+        "event_title": event_title,
+        "date_txt": date_txt,
+        "event_type": data.event_type or "其他",
+        "stock": stock,
+        "note": data.note,
+        "warn": warn,
+        "auto_created": auto_created,
+        "is_cb_unfiled": is_cb_unfiled,
+        "url": result.get("url", ""),
+    }
+
+
+def _handle_timeline(text: str):
+    """開頭是「時程」前綴 → 寫進 Notion 時間軸並回覆;支援批次(一行一筆);否則回傳 None。"""
+    s = text.strip()
+    lines = s.splitlines()
+    first_line = lines[0].strip() if lines else ""
+    matched = next((p for p in _TIMELINE_PREFIXES if first_line.startswith(p)), None)
+    if matched is None:
+        return None
+
+    # 收集「事件行」:前綴同一行若有內容算一筆,之後每個非空行各算一筆(可一次多檔)
+    bodies: List[str] = []
+    head = first_line[len(matched):].strip(" :：、,，.。")
+    if head:
+        bodies.append(head)
+    for ln in lines[1:]:
+        ln = ln.strip(" :：、,，.。")
+        if ln:
+            bodies.append(ln)
+
+    if not bodies:
+        raise NoCategoryError(_TIMELINE_USAGE)
+
+    # 一次太多筆會拖慢寫入、可能超過 LINE 回覆時限,請分批
+    if len(bodies) > 20:
+        raise NoCategoryError(
+            f"🗓️ 一次最多 20 筆(這次 {len(bodies)} 筆)。請分次貼,避免寫入逾時。"
+        )
+
+    if not notion_timeline.enabled():
+        raise NoCategoryError(
+            "⚠️ 時程功能尚未啟用:請先在環境變數設定 NOTION_TOKEN"
+            "(Notion integration 密鑰,並把「股票投資大腦」頁面分享給該 integration)。"
+        )
+
+    parsed = _parse_timeline_many(bodies)
+
+    # ---- 單筆:維持原本詳細回覆 ----
+    if len(bodies) == 1:
+        try:
+            r = _store_timeline_event(parsed[0], bodies[0])
+        except _TimelineItemError as e:
+            raise NoCategoryError(f"🗓️ {e}")
+        stock = r["stock"]
+        linked = f"🔗 {stock['label']}" if stock else "(未關聯個股)"
+        n_concept = len(stock.get("concept_ids") or []) if stock else 0
+        concept_txt = f"（已自動歸類 {n_concept} 個概念）" if n_concept else ""
+        reply = (
+            "🗓️ 已寫入 Notion 時間軸\n"
+            f"• 事件:{r['event_title']}\n"
+            f"• 日期:{r['date_txt']}\n"
+            f"• 類型:{r['event_type']}\n"
+            f"• 個股:{linked}{concept_txt}"
+            + (f"\n• 備註:{r['note']}" if r["note"] else "")
+            + r["warn"]
+        )
+        if r["url"]:
+            reply += f"\n{r['url']}"
+        return Result(label="時程", reply=reply)
+
+    # ---- 批次:每行一筆,逐筆寫入,回覆彙整(單筆失敗不影響其他筆) ----
+    ok_lines, fail_lines = [], []
+    for data, body in zip(parsed, bodies):
+        try:
+            r = _store_timeline_event(data, body)
+        except _TimelineItemError as e:
+            fail_lines.append(f"⚠️ {body} — {e}")
+            continue
+        except Exception as e:  # 單筆寫入意外失敗也不中斷整批
+            logger.warning("批次時程單筆寫入失敗:%s", e)
+            fail_lines.append(f"⚠️ {body} — 寫入失敗:{e}")
+            continue
+        if r["stock"]:
+            mark = "🆕" if r["auto_created"] else "🔗"
+        else:
+            mark = "·CB未建檔" if r["is_cb_unfiled"] else "(未關聯)"
+        ok_lines.append(f"✅ {r['event_title']} — {r['date_txt']} {mark}")
+
+    head_txt = f"🗓️ 時程批次寫入:成功 {len(ok_lines)} 筆" + (
+        f"、失敗 {len(fail_lines)} 筆" if fail_lines else ""
     )
-    if result.get("url"):
-        reply += f"\n{result['url']}"
-    return Result(label="時程", reply=reply)
+    parts = [head_txt]
+    if ok_lines:
+        parts.append("\n".join(ok_lines))
+    if fail_lines:
+        parts.append("\n".join(fail_lines))
+    return Result(label="時程", reply="\n\n".join(parts))
 
 
 # 關注筆記的日期覆寫詞:詞 → (相對天數)
