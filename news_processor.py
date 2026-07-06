@@ -578,10 +578,18 @@ _WATCHLIST_USAGE = (
 _NOTE_PREFIXES = ("隨筆", "隨手筆記", "隨手記", "備忘")
 _NOTE_TYPE = "隨手筆記"
 _TODAY_NOTES_WORDS = {"今日隨筆", "今天隨筆", "本日隨筆", "今日筆記", "今天筆記"}
+# 刪除/修改今天的隨筆(用「今日隨筆」列表的編號指定)
+_NOTE_DELETE_PREFIXES = ("刪隨筆", "刪除隨筆", "刪掉隨筆", "移除隨筆")
+_NOTE_EDIT_PREFIXES = ("改隨筆", "修改隨筆", "編輯隨筆")
 _NOTE_USAGE = (
     "📝 隨筆用法:「隨筆」後面接想記的內容(可多行),例如:\n"
     "隨筆 台積電 CoWoS 產能吃緊,留意設備股\n"
-    "當天的隨筆會在晚上 21:00 隨推播彙整;打「今日隨筆」可即時叫出當天已記的。"
+    "當天的隨筆會在晚上 21:00 隨推播彙整;打「今日隨筆」可即時叫出當天已記的。\n"
+    "\n"
+    "打錯要改/刪(先打「今日隨筆」看編號):\n"
+    "• 刪隨筆 2      刪掉第 2 則(可一次多筆:刪隨筆 2 4)\n"
+    "• 刪隨筆        不帶編號=刪掉最新一則\n"
+    "• 改隨筆 2 新內容   把第 2 則改成新內容"
 )
 
 # 「說明」指令:整段訊息完全等於這些字才觸發(避免新聞內文誤中)
@@ -613,7 +621,9 @@ _HELP_TEXT = (
     "\n"
     "━━ 隨手筆記 ━━(隨時記,當天 21:00 隨推播彙整)\n"
     "• 隨筆 台積電CoWoS產能吃緊,留意設備股\n"
-    "• 打「今日隨筆」叫出今天已記的(依時間排序)\n"
+    "• 打「今日隨筆」叫出今天已記的(有編號)\n"
+    "• 刪隨筆 2(刪第2則,不帶編號=刪最新)\n"
+    "• 改隨筆 2 新內容(改第2則)\n"
     "\n"
     "━━ 查行事曆 ━━(唯讀,列出某段期間的事件)\n"
     "• 本週 / 下週\n"
@@ -664,7 +674,8 @@ def is_group_additive_command(text: str) -> bool:
     first = s.splitlines()[0].strip()
     additive_prefixes = (
         tuple(_TIMELINE_PREFIXES) + tuple(_WATCHLIST_PREFIXES)
-        + tuple(_NOTE_PREFIXES) + tuple(_FETCH_EARNINGS_PREFIXES)
+        + tuple(_NOTE_PREFIXES) + tuple(_NOTE_DELETE_PREFIXES)
+        + tuple(_NOTE_EDIT_PREFIXES) + tuple(_FETCH_EARNINGS_PREFIXES)
         + tuple(_FETCH_ECON_PREFIXES)
     )
     if QUERY_ENABLED:
@@ -812,6 +823,15 @@ def route_and_store(text: str) -> Result:
                 "🔍 查詢用法:在「查」後面接你的問題。\n例如:\n查 光聖最近有什麼時程\n查 這週的全球局勢重點"
             )
         return _answer_query(question)
+
+    # 「刪隨筆/改隨筆」→ 刪除或修改今天的隨筆;要在通用「改」修正指令之前判斷
+    # (否則「改隨筆」會被 _handle_correction 的「改」攔走)
+    note_delete = _handle_note_delete(text)
+    if note_delete is not None:
+        return note_delete
+    note_edit = _handle_note_edit(text)
+    if note_edit is not None:
+        return note_edit
 
     # 再看是不是「修正指令」(主表 / 改),是的話處理、不寫入新聞
     correction = _handle_correction(text)
@@ -1212,8 +1232,96 @@ def _handle_today_notes(text: str):
     head = f"📝 今日隨筆 {today.month}/{today.day}"
     if not notes:
         return Result(label="今日隨筆", reply=f"{head}\n\n(今天還沒有隨筆,用「隨筆 …」開始記)")
-    body = "\n".join(f"・{n['time'] + ' ' if n['time'] else ''}{n['title']}" for n in notes)
-    return Result(label="今日隨筆", reply=f"{head}(共 {len(notes)} 則)\n\n{body}")
+    body = "\n".join(
+        f"{i}. {n['time'] + ' ' if n['time'] else ''}{n['title']}"
+        for i, n in enumerate(notes, 1)
+    )
+    tip = "\n\n改/刪打「刪隨筆 編號」或「改隨筆 編號 新內容」"
+    return Result(label="今日隨筆", reply=f"{head}(共 {len(notes)} 則)\n\n{body}{tip}")
+
+
+def _match_prefix(text: str, prefixes) -> tuple[str, str] | None:
+    """第一行以任一 prefix 開頭 → 回傳 (matched_prefix, 去掉前綴後整段訊息的剩餘文字)。"""
+    s = text.strip()
+    first = s.splitlines()[0].strip() if s else ""
+    matched = next((p for p in prefixes if first.startswith(p)), None)
+    if matched is None:
+        return None
+    rest = s[s.find(first) + len(matched):].strip(" :：、,，.。\n")
+    return matched, rest
+
+
+def _handle_note_delete(text: str):
+    """「刪隨筆 [編號…]」→ 刪掉今天第 N 則隨筆(用「今日隨筆」的編號);不帶編號=刪最新一則。"""
+    m = _match_prefix(text, _NOTE_DELETE_PREFIXES)
+    if m is None:
+        return None
+    if not notion_timeline.enabled():
+        raise NoCategoryError("⚠️ 尚未啟用:請先設定 NOTION_TOKEN。")
+    _, rest = m
+    today = datetime.datetime.now(notion_timeline.TW_TZ).date()
+    notes = notion_timeline.list_notes_by_date(today.isoformat(), _NOTE_TYPE)
+    if not notes:
+        return Result(label="刪隨筆", reply="今天還沒有隨筆可刪。")
+
+    tokens = rest.split()
+    if not tokens:
+        idxs = [len(notes)]  # 不帶編號 → 刪最新一則(列表最後一筆)
+    else:
+        try:
+            idxs = sorted({int(t) for t in tokens})
+        except ValueError:
+            raise NoCategoryError(
+                "⚠️ 編號要用數字,例如「刪隨筆 2」或「刪隨筆 2 4」。\n先打「今日隨筆」看編號。"
+            )
+    bad = [i for i in idxs if i < 1 or i > len(notes)]
+    if bad:
+        raise NoCategoryError(
+            f"⚠️ 今天只有 {len(notes)} 則隨筆,沒有第 {'、'.join(map(str, bad))} 則。\n"
+            "先打「今日隨筆」看編號。"
+        )
+    # 先由快照解析出頁 id 再刪,避免刪一筆後編號位移
+    deleted = []
+    for i in idxs:
+        n = notes[i - 1]
+        notion_timeline.archive_page(n["id"])
+        deleted.append(f"{i}. {n['title']}")
+    body = "\n".join(deleted)
+    return Result(label="刪隨筆", reply=f"🗑️ 已刪除 {len(deleted)} 則隨筆:\n{body}")
+
+
+def _handle_note_edit(text: str):
+    """「改隨筆 編號 新內容」→ 把今天第 N 則隨筆改成新內容(保留原記錄時間、維持排序位置)。"""
+    m = _match_prefix(text, _NOTE_EDIT_PREFIXES)
+    if m is None:
+        return None
+    if not notion_timeline.enabled():
+        raise NoCategoryError("⚠️ 尚未啟用:請先設定 NOTION_TOKEN。")
+    _, rest = m
+    parts = rest.split(None, 1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        raise NoCategoryError(
+            "⚠️ 用法:「改隨筆 編號 新內容」,例如「改隨筆 2 台積電擴產留意設備股」。\n"
+            "先打「今日隨筆」看編號。"
+        )
+    idx, new_content = int(parts[0]), parts[1].strip()
+    if not new_content:
+        raise NoCategoryError("⚠️ 新內容不能空白。")
+    today = datetime.datetime.now(notion_timeline.TW_TZ).date()
+    notes = notion_timeline.list_notes_by_date(today.isoformat(), _NOTE_TYPE)
+    if not notes:
+        return Result(label="改隨筆", reply="今天還沒有隨筆可改。")
+    if idx < 1 or idx > len(notes):
+        raise NoCategoryError(
+            f"⚠️ 今天只有 {len(notes)} 則隨筆,沒有第 {idx} 則。先打「今日隨筆」看編號。"
+        )
+    old = notes[idx - 1]
+    notion_timeline.update_note(old["id"], new_content)
+    preview = new_content if len(new_content) <= 60 else new_content[:60] + "…"
+    return Result(
+        label="改隨筆",
+        reply=f"✏️ 第 {idx} 則已改為:\n{preview}\n(原:{old['title'][:40]})",
+    )
 
 
 _FETCH_EARNINGS_PREFIXES = ("更新法說會", "抓法說會", "法說會更新")

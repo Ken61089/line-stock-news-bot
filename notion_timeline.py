@@ -146,9 +146,43 @@ def list_notes_by_date(date_iso: str, event_type: str = "隨手筆記") -> list[
             hhmm = datetime.datetime.fromisoformat(stamp).astimezone(TW_TZ).strftime("%H:%M")
         except (ValueError, TypeError):
             stamp = ""  # 排序鍵無效者(空字串)排最前
-        out.append({"title": title or "(空白筆記)", "time": hhmm, "_k": stamp})
+        out.append({"id": pg["id"], "title": title or "(空白筆記)", "time": hhmm, "_k": stamp})
     out.sort(key=lambda x: x["_k"])
-    return [{"title": x["title"], "time": x["time"]} for x in out]
+    return [{"id": x["id"], "title": x["title"], "time": x["time"]} for x in out]
+
+
+def archive_page(page_id: str) -> None:
+    """封存(刪除)單一頁面。用於刪除某一則隨筆等。"""
+    _patch(f"/pages/{page_id}", {"archived": True})
+
+
+def update_note(page_id: str, content: str) -> None:
+    """改寫某一則隨手筆記的內容:更新標題(Name)與 Quick Note 內文,
+    但保留 Quick Note 首行的 ISO 時間戳(排序鍵),讓它在當天列表維持原位置。"""
+    content = (content or "").strip()
+    stamp = ""
+    try:
+        page = _get(f"/pages/{page_id}")
+        quick = "".join(
+            t.get("plain_text", "")
+            for t in page.get("properties", {}).get("Quick Note", {}).get("rich_text", [])
+        )
+        first = quick.splitlines()[0].strip() if quick else ""
+        datetime.datetime.fromisoformat(first)  # 驗證是合法時間戳才沿用
+        stamp = first
+    except (ValueError, TypeError, KeyError):
+        stamp = datetime.datetime.now(TW_TZ).isoformat(timespec="seconds")
+    overflow = content if len(content) > 200 else ""
+    new_quick = stamp + (("\n" + overflow) if overflow else "")
+    _patch(
+        f"/pages/{page_id}",
+        {
+            "properties": {
+                "Name": {"title": [{"text": {"content": content[:200] or "(空白筆記)"}}]},
+                "Quick Note": {"rich_text": [{"text": {"content": new_quick[:1900]}}]},
+            }
+        },
+    )
 
 
 def find_stock_page(code: str, name: str = "") -> dict | None:
