@@ -666,8 +666,18 @@ _WATCHLIST_USAGE = (
     "2330 台積電 站上季線再追\n"
     "3661 世芯 觀察缺口\n"
     "(想指定今天請用「關注 今天 ...」;預設是隔天)\n"
-    "📌 同一天再打一次「關注」= 整批更新成最新版(會蓋掉當天舊的)"
+    "📌 同一天再打一次「關注」= 整批更新成最新版(會蓋掉當天舊的)\n"
+    "\n"
+    "查看/修改(先打「明日關注」看編號):\n"
+    "• 明日關注 / 今日關注   列出該日清單\n"
+    "• 刪關注 2(刪明日第2筆,可多筆 刪關注 2 4;不帶編號=刪最新)\n"
+    "• 改關注 2 新內容(改明日第2筆)"
 )
+# 關注的查看(整段字比對)與刪改(針對「明日」= 關注預設存入日)
+_WATCHLIST_TODAY_WORDS = {"今日關注", "今天關注", "本日關注"}
+_WATCHLIST_TMR_WORDS = {"明日關注", "明天關注"}
+_WATCHLIST_DELETE_PREFIXES = ("刪關注", "刪除關注", "刪掉關注", "移除關注")
+_WATCHLIST_EDIT_PREFIXES = ("改關注", "修改關注", "編輯關注")
 
 # 隨手筆記:團隊隨時記,當天 21:00 隨推播彙整;「今日隨筆」可即時叫出當天已記的
 _NOTE_PREFIXES = ("隨筆", "隨手筆記", "隨手記", "備忘")
@@ -713,6 +723,8 @@ _HELP_TEXT = (
     "━━ 隔日盯盤 ━━(「關注」開頭,隔天 08:30 隨推播通知)\n"
     "• 關注 2330 台積電 站上季線再追\n"
     "• 多檔:「關注」換行後一行一檔\n"
+    "• 明日關注 / 今日關注(列出清單、有編號)\n"
+    "• 刪關注 2、改關注 2 新內容(針對明日)\n"
     "\n"
     "━━ 隨手筆記 ━━(隨時記,當天 21:00 隨推播彙整)\n"
     "• 隨筆 台積電CoWoS產能吃緊,留意設備股\n"
@@ -767,11 +779,12 @@ def is_group_additive_command(text: str) -> bool:
         return False
     if s.lower() in _HELP_WORDS:
         return True
-    if s in _TODAY_NOTES_WORDS:
+    if s in _TODAY_NOTES_WORDS or s in _WATCHLIST_TODAY_WORDS or s in _WATCHLIST_TMR_WORDS:
         return True
     first = s.splitlines()[0].strip()
     additive_prefixes = (
         tuple(_TIMELINE_PREFIXES) + tuple(_WATCHLIST_PREFIXES)
+        + tuple(_WATCHLIST_DELETE_PREFIXES) + tuple(_WATCHLIST_EDIT_PREFIXES)
         + tuple(_NOTE_PREFIXES) + tuple(_NOTE_DELETE_PREFIXES)
         + tuple(_NOTE_EDIT_PREFIXES) + tuple(_FETCH_EARNINGS_PREFIXES)
         + tuple(_FETCH_ECON_PREFIXES)
@@ -931,6 +944,14 @@ def route_and_store(text: str) -> Result:
     if note_edit is not None:
         return note_edit
 
+    # 「刪關注/改關注」→ 刪或改明日關注;同樣要在通用「改」修正指令之前判斷
+    watchlist_delete = _handle_watchlist_delete(text)
+    if watchlist_delete is not None:
+        return watchlist_delete
+    watchlist_edit = _handle_watchlist_edit(text)
+    if watchlist_edit is not None:
+        return watchlist_edit
+
     # 再看是不是「修正指令」(主表 / 改),是的話處理、不寫入新聞
     correction = _handle_correction(text)
     if correction is not None:
@@ -940,6 +961,11 @@ def route_and_store(text: str) -> Result:
     timeline = _handle_timeline(text)
     if timeline is not None:
         return timeline
+
+    # 「今日關注/明日關注」→ 列出該日關注清單;要在 _handle_watchlist 之前判斷
+    watchlist_list = _handle_watchlist_list(text)
+    if watchlist_list is not None:
+        return watchlist_list
 
     # 「關注」開頭 → 隔日盯盤筆記,寫進 Notion(隔天 08:30 隨推播帶出)
     watchlist = _handle_watchlist(text)
@@ -1407,6 +1433,101 @@ def _handle_watchlist(text: str):
         f"{tail}"
     )
     return Result(label="關注", reply=reply)
+
+
+def _watchlist_items(offset: int):
+    """回 (target_date, [{'id','title'}]):某日(offset 天後)的每日關注清單。"""
+    d = datetime.datetime.now(notion_timeline.TW_TZ).date() + datetime.timedelta(days=offset)
+    return d, notion_timeline.list_events_by_type_date(_WATCHLIST_TYPE, d.isoformat())
+
+
+def _handle_watchlist_list(text: str):
+    """整段是「今日關注/明日關注」→ 列出該日關注清單(有編號);否則 None。"""
+    s = text.strip()
+    if s in _WATCHLIST_TMR_WORDS:
+        offset, label = 1, "明日"
+    elif s in _WATCHLIST_TODAY_WORDS:
+        offset, label = 0, "今日"
+    else:
+        return None
+    if not notion_timeline.enabled():
+        raise NoCategoryError("⚠️ 尚未啟用:請先設定 NOTION_TOKEN。")
+    d, items = _watchlist_items(offset)
+    head = f"👀 {label}關注 {d.month}/{d.day}"
+    if not items:
+        hint = ",用「關注 …」開始盯" if offset == 1 else ""
+        return Result(label="關注清單", reply=f"{head}\n\n({label}還沒有關注{hint})")
+    body = "\n".join(f"{i}. {it['title']}" for i, it in enumerate(items, 1))
+    tip = "\n\n改/刪打「刪關注 編號」或「改關注 編號 新內容」(針對明日)" if offset == 1 else ""
+    return Result(label="關注清單", reply=f"{head}(共 {len(items)} 筆)\n\n{body}{tip}")
+
+
+def _handle_watchlist_delete(text: str):
+    """「刪關注 [編號…]」→ 刪掉明日關注第 N 筆;不帶編號=刪最新一筆。"""
+    m = _match_prefix(text, _WATCHLIST_DELETE_PREFIXES)
+    if m is None:
+        return None
+    if not notion_timeline.enabled():
+        raise NoCategoryError("⚠️ 尚未啟用:請先設定 NOTION_TOKEN。")
+    _, rest = m
+    _, items = _watchlist_items(1)
+    if not items:
+        return Result(label="刪關注", reply="明日還沒有關注可刪。")
+    tokens = rest.split()
+    if not tokens:
+        idxs = [len(items)]  # 不帶編號 → 刪最新(列表最後一筆)
+    else:
+        try:
+            idxs = sorted({int(t) for t in tokens})
+        except ValueError:
+            raise NoCategoryError(
+                "⚠️ 編號要用數字,例如「刪關注 2」或「刪關注 2 4」。\n先打「明日關注」看編號。"
+            )
+    bad = [i for i in idxs if i < 1 or i > len(items)]
+    if bad:
+        raise NoCategoryError(
+            f"⚠️ 明日只有 {len(items)} 筆關注,沒有第 {'、'.join(map(str, bad))} 筆。\n"
+            "先打「明日關注」看編號。"
+        )
+    deleted = []
+    for i in idxs:  # 先由快照解析頁 id 再刪,避免刪一筆後編號位移
+        it = items[i - 1]
+        notion_timeline.archive_page(it["id"])
+        deleted.append(f"{i}. {it['title']}")
+    return Result(label="刪關注", reply=f"🗑️ 已從明日關注刪除 {len(deleted)} 筆:\n" + "\n".join(deleted))
+
+
+def _handle_watchlist_edit(text: str):
+    """「改關注 編號 新內容」→ 改明日關注第 N 筆內容。"""
+    m = _match_prefix(text, _WATCHLIST_EDIT_PREFIXES)
+    if m is None:
+        return None
+    if not notion_timeline.enabled():
+        raise NoCategoryError("⚠️ 尚未啟用:請先設定 NOTION_TOKEN。")
+    _, rest = m
+    parts = rest.split(None, 1)
+    if len(parts) < 2 or not parts[0].isdigit():
+        raise NoCategoryError(
+            "⚠️ 用法:「改關注 編號 新內容」,例如「改關注 2 2330 台積電 站上季線」。\n"
+            "先打「明日關注」看編號。"
+        )
+    idx, new_content = int(parts[0]), parts[1].strip()
+    if not new_content:
+        raise NoCategoryError("⚠️ 新內容不能空白。")
+    _, items = _watchlist_items(1)
+    if not items:
+        return Result(label="改關注", reply="明日還沒有關注可改。")
+    if idx < 1 or idx > len(items):
+        raise NoCategoryError(
+            f"⚠️ 明日只有 {len(items)} 筆關注,沒有第 {idx} 筆。先打「明日關注」看編號。"
+        )
+    old = items[idx - 1]
+    notion_timeline.update_event_title(old["id"], new_content)
+    preview = new_content if len(new_content) <= 60 else new_content[:60] + "…"
+    return Result(
+        label="改關注",
+        reply=f"✏️ 明日關注第 {idx} 筆已改為:\n{preview}\n(原:{old['title'][:40]})",
+    )
 
 
 def _handle_note(text: str):

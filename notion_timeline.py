@@ -158,6 +158,37 @@ def archive_page(page_id: str) -> None:
     _patch(f"/pages/{page_id}", {"archived": True})
 
 
+def list_events_by_type_date(event_type: str, date_iso: str) -> list[dict]:
+    """列某日某事件類型的所有事件,依建立時間排序,回 [{'id','title'}]。
+    用於「明日/今日關注」列表(關注本身無時間排序鍵,改用 created_time 保證順序穩定)。"""
+    data = _post(
+        f"/data_sources/{TIMELINE_DS}/query",
+        {
+            "filter": {"and": [
+                {"property": "事件類型", "select": {"equals": event_type}},
+                {"property": "關鍵日期", "date": {"equals": date_iso}},
+            ]},
+            "sorts": [{"timestamp": "created_time", "direction": "ascending"}],
+            "page_size": 100,
+        },
+    )
+    out = []
+    for pg in data.get("results", []):
+        title = "".join(
+            t.get("plain_text", "") for t in pg.get("properties", {}).get("Name", {}).get("title", [])
+        ).strip()
+        out.append({"id": pg["id"], "title": title or "(空白)"})
+    return out
+
+
+def update_event_title(page_id: str, title: str) -> None:
+    """只更新事件標題(Name)。用於「改關注」。"""
+    _patch(
+        f"/pages/{page_id}",
+        {"properties": {"Name": {"title": [{"text": {"content": title[:200] or "(空白)"}}]}}},
+    )
+
+
 def update_note(page_id: str, content: str) -> None:
     """改寫某一則隨手筆記的內容:更新標題(Name)與 Quick Note 內文,
     但保留 Quick Note 首行的 ISO 時間戳(排序鍵),讓它在當天列表維持原位置。"""
