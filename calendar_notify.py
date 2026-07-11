@@ -512,10 +512,15 @@ def maybe_start_scheduler() -> None:
         _safe(notify_daily), CronTrigger(hour=d_h, minute=d_m, timezone=tz),
         id="daily", replace_existing=True,
     )
-    sched.add_job(
-        _safe(notify_tomorrow), CronTrigger(hour=t_h, minute=t_m, timezone=tz),
-        id="tomorrow", replace_existing=True,
-    )
+    # 每日 21:00「明日事件＋今日隨筆彙整」推播:2026-07-07 起預設關閉以節省 LINE push 則數
+    # (要恢復設 ENABLE_TOMORROW_NOTIFY=1;隨筆仍可隨時打「今日隨筆」用 reply 查,不計則數)
+    tomorrow_log = ""
+    if os.environ.get("ENABLE_TOMORROW_NOTIFY", "0").strip() != "0":
+        sched.add_job(
+            _safe(notify_tomorrow), CronTrigger(hour=t_h, minute=t_m, timezone=tz),
+            id="tomorrow", replace_existing=True,
+        )
+        tomorrow_log = f"、每日 {t_h:02d}:{t_m:02d} 推明日"
     sched.add_job(
         _safe(notify_weekly), CronTrigger(day_of_week=w_dow, hour=w_h, minute=w_m, timezone=tz),
         id="weekly", replace_existing=True,
@@ -537,15 +542,16 @@ def maybe_start_scheduler() -> None:
                 id="fetch_econ", replace_existing=True,
             )
             fetch_log += f"、每日 {e_h:02d}:{e_m:02d} 抓美國經濟事件"
-        # 全天每 30 分鐘監看 MOPS 即時重大訊息,追蹤股命中就推警示(06:00~23:30)
-        mops_min = os.environ.get("MOPS_CHECK_MINUTES", "0,30")
-        mops_hours = os.environ.get("MOPS_CHECK_HOURS", "6-23")
+        # 每 2 小時監看 MOPS 即時重大訊息,追蹤股命中就把該窗全部命中「合併成一則」推播
+        # (降低 LINE push 則數以守住免費 200 則/月;每輪的多筆命中本來就合併成一則)
+        mops_min = os.environ.get("MOPS_CHECK_MINUTES", "0")
+        mops_hours = os.environ.get("MOPS_CHECK_HOURS", "6-22/2")
         sched.add_job(
             _safe(fetchers.check_mops_alerts),
             CronTrigger(hour=mops_hours, minute=mops_min, timezone=tz),
             id="mops_alerts", replace_existing=True,
         )
-        fetch_log += "、每 30 分監看重大訊息"
+        fetch_log += "、每 2 小時監看重大訊息"
     except Exception:  # noqa: BLE001
         logger.exception("fetchers 掛載失敗,法說會自動抓取不啟用")
         fetch_log = ""
@@ -553,9 +559,9 @@ def maybe_start_scheduler() -> None:
     sched.start()
     _scheduler = sched
     logger.info(
-        "行事曆排程已啟動:每日 %02d:%02d 推當日、每日 %02d:%02d 推明日、"
+        "行事曆排程已啟動:每日 %02d:%02d 推當日%s、"
         "每週 %s %02d:%02d 推下週%s(台灣時間)。",
-        d_h, d_m, t_h, t_m, _WEEKDAY_ZH[w_dow], w_h, w_m, fetch_log,
+        d_h, d_m, tomorrow_log, _WEEKDAY_ZH[w_dow], w_h, w_m, fetch_log,
     )
 
 
