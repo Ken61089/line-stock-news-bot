@@ -573,12 +573,52 @@ def _parse_hhmm(s: str, dh: int, dm: int) -> tuple[int, int]:
         return dh, dm
 
 
+# ---- 排程失敗告警(靜默失敗保護)----
+# 背景:_safe() 會吞掉所有例外、只寫 log,任務失敗時完全不會被發現。
+# 2026-07 踩過:Firecrawl 額度用盡 → 每日 06:20 的 MacroMicro 經濟事件抓取連續失敗多天,
+# 機器人照跑、其他排程正常、Notion 就是沒資料進來,只有翻 Zeabur log 才看得到。
+# MacroMicro 有 Cloudflare,fetchers 明確不能用純 httpx fallback,所以這條沒有備援路徑。
+_JOB_FAILS: dict[str, int] = {}
+# 連續失敗幾次才告警(預設 2;避免單次網路抖動就吵人)
+JOB_ALERT_AFTER = int(os.environ.get("JOB_ALERT_AFTER", "2"))
+# 持續失敗時每隔幾次再提醒一次(預設 12;避免洗版吃掉 LINE 免費 200 則/月額度)
+JOB_ALERT_REPEAT = int(os.environ.get("JOB_ALERT_REPEAT", "12"))
+
+
+def _alert(text: str) -> None:
+    """告警推播;告警本身失敗只寫 log,絕不讓它拖垮排程。"""
+    try:
+        push(text)
+    except Exception:  # noqa: BLE001
+        logger.exception("告警推播失敗(原訊息:%s)", text[:80])
+
+
 def _safe(fn):
+    name = getattr(fn, "__name__", str(fn))
+
     def wrapper():
         try:
             fn()
         except Exception:  # noqa: BLE001
-            logger.exception("排程任務執行失敗:%s", getattr(fn, "__name__", fn))
+            logger.exception("排程任務執行失敗:%s", name)
+            n = _JOB_FAILS[name] = _JOB_FAILS.get(name, 0) + 1
+            # 剛好到門檻時告警一次;之後每 JOB_ALERT_REPEAT 次再提醒,不每次都推
+            if n == JOB_ALERT_AFTER or (n > JOB_ALERT_AFTER and n % JOB_ALERT_REPEAT == 0):
+                _alert(
+                    "⚠️ 排程異常\n"
+                    f"任務:{name}\n"
+                    f"已連續失敗 {n} 次\n"
+                    "常見原因:Firecrawl 額度用盡 / 來源網站改版 / API key 失效\n"
+                    "查原因:Zeabur log。查額度:打「用量」"
+                )
+        else:
+            # 從失敗中恢復也要通知,否則不知道問題何時解決(或以為還壞著)
+            prev = _JOB_FAILS.get(name, 0)
+            if prev >= JOB_ALERT_AFTER:
+                _alert(f"✅ 排程已恢復:{name}(先前連續失敗 {prev} 次)")
+            _JOB_FAILS[name] = 0
+
+    wrapper.__name__ = name
     return wrapper
 
 
