@@ -30,13 +30,21 @@ MACROMICRO_URL = "https://www.macromicro.me/calendar"
 FIRECRAWL_API_KEY = os.environ.get("FIRECRAWL_API_KEY", "").strip()
 FIRECRAWL_BASE_URL = os.environ.get("FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/")
 _ECON_TYPE = "經濟數據"
-_ECON_HORIZON_DAYS = 45
+_ECON_HORIZON_DAYS = int(os.environ.get("ECON_HORIZON_DAYS", "60"))  # 抓當月+下月,60天確保下月完整涵蓋
 # 把 MacroMicro 行事曆「區域」下拉選成美國(option value=us),觸發只顯示美國事件
 _MM_SELECT_US_JS = (
     "document.querySelectorAll('select').forEach(function(s){"
     "if(Array.prototype.some.call(s.options,function(o){return o.value==='us';}))"
     "{s.value='us';s.dispatchEvent(new Event('change',{bubbles:true}));}});"
 )
+# 點行事曆工具列「下一月」箭頭(FontAwesome fa-chevron-right;左箭頭是上一月)。
+# 用來翻到下個月抓資料——月底時當月月曆已看不到下月的 CPI/FOMC 等,靠翻月補齊。
+_MM_NEXT_MONTH_JS = (
+    "(function(){var i=document.querySelector('.fa-chevron-right');"
+    "if(i){var el=i.closest('button,a,[role=button]')||i.parentElement||i;el.click();}})()"
+)
+# 抓幾個月(當月起算):預設 2 = 當月 + 下月,可用 env ECON_MONTHS 調整
+_ECON_MONTHS = max(1, int(os.environ.get("ECON_MONTHS", "2")))
 _MM_MONTH_RE = re.compile(r"####\s*(\d{4})\s*年\s*(\d{1,2})\s*月")
 _MM_DAY_RE = re.compile(r"\*\*(\d{1,2})(?:[（(]週.[)）])?\*\*")
 _MM_EVENT_RE = re.compile(r"\[([^\]]+?)\]\((https://www\.macromicro\.me/[^)]+)\)")
@@ -215,24 +223,29 @@ def econ_enabled() -> bool:
     return bool(FIRECRAWL_API_KEY)
 
 
-def fetch_macromicro_md() -> str:
-    """經 Firecrawl 抓 MacroMicro 行事曆,回傳 markdown(MacroMicro 有 Cloudflare,純 httpx 會 403)。"""
+def fetch_macromicro_md(month_offset: int = 0) -> str:
+    """經 Firecrawl 抓 MacroMicro 行事曆,回傳 markdown(MacroMicro 有 Cloudflare,純 httpx 會 403)。
+    month_offset:0=當月,1=下個月…(靠點工具列「下一月」箭頭翻頁)。"""
     if not FIRECRAWL_API_KEY:
         raise RuntimeError("未設定 FIRECRAWL_API_KEY,無法抓 MacroMicro(Cloudflare 需 Firecrawl)")
+    # location=台灣 → MacroMicro 直接渲染成台灣時間/日期(不必自己換時區,和使用者看到的一致);
+    # 用 JS 把「區域」下拉選成美國(option value=us)→ 只留美國事件,不被亞洲事件擠掉摺疊區。
+    actions = [
+        {"type": "executeJavascript", "script": _MM_SELECT_US_JS},
+        {"type": "wait", "milliseconds": 3000},
+    ]
+    for _ in range(max(0, month_offset)):  # 逐月點「下一月」,每次等月曆重繪
+        actions.append({"type": "executeJavascript", "script": _MM_NEXT_MONTH_JS})
+        actions.append({"type": "wait", "milliseconds": 3500})
     r = httpx.post(
         f"{FIRECRAWL_BASE_URL}/v2/scrape",
         headers={"Authorization": f"Bearer {FIRECRAWL_API_KEY}"},
-        # location=台灣 → MacroMicro 直接渲染成台灣時間/日期(不必自己換時區,和使用者看到的一致);
-        # 用 JS 把「區域」下拉選成美國(option value=us)→ 只留美國事件,不被亞洲事件擠掉摺疊區。
         json={
             "url": MACROMICRO_URL,
             "formats": ["markdown"],
             "waitFor": 5000,
             "location": {"country": "TW", "languages": ["zh-TW"]},
-            "actions": [
-                {"type": "executeJavascript", "script": _MM_SELECT_US_JS},
-                {"type": "wait", "milliseconds": 5000},
-            ],
+            "actions": actions,
         },
         timeout=120,
     )
@@ -315,7 +328,23 @@ def sync_econ_events(dry_run: bool = False) -> dict:
     horizon = (today + datetime.timedelta(days=_ECON_HORIZON_DAYS)).isoformat()
     today_iso = today.isoformat()
 
-    rows = [r for r in parse_macromicro_us(fetch_macromicro_md()) if today_iso <= r["date"] <= horizon]
+    # 抓當月 + 下個月(月底時當月月曆看不到下月的 CPI/FOMC,靠翻月補齊);合併去重
+    raw = []
+    for off in range(_ECON_MONTHS):
+        try:
+            raw += parse_macromicro_us(fetch_macromicro_md(off))
+        except Exception as e:  # noqa: BLE001 — 某一月抓失敗不影響其他月
+            logger.warning("MacroMicro 第 %d 個月抓取失敗:%s", off, e)
+    seen, rows = set(), []
+    for r in raw:
+        if not (today_iso <= r["date"] <= horizon):
+            continue
+        key = (r["name"], r["date"])  # 跨月邊界日可能重複,依(標題,日期)去重
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(r)
+    rows.sort(key=lambda r: (r["date"], r["name"]))
     existing = _existing_econ(today)
 
     added, skipped, items = 0, 0, []
