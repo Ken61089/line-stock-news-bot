@@ -408,6 +408,13 @@ def fetch_mops_announcements() -> list[dict]:
 
 
 def _push_line(text: str) -> None:
+    try:  # 主動推播總開關關閉時只跳過推播;MOPS 掃描/寫 Notion 照常(查重訊仍查得到)
+        import calendar_notify
+        if not calendar_notify.is_push_enabled():
+            logger.info("主動推播已暫停,MOPS 命中改只記 Notion、略過推播")
+            return
+    except Exception:  # noqa: BLE001
+        pass
     token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
     target = os.environ.get("LINE_NOTIFY_TARGET_ID", "").strip()
     if not (token and target):

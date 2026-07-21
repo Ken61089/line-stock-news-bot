@@ -380,8 +380,68 @@ def format_weekly(events: list[dict], start: datetime.date, end: datetime.date) 
     return f"{head}\n\n{body}"
 
 
+# ---- 主動推播總開關(守 LINE 免費額度;可用 LINE 指令即時開關,env PUSH_ENABLED 設持久預設)----
+# 關閉時:早報/週報/MOPS 都不推(不耗額度);但 MOPS 仍照常掃描、命中仍寫進 Notion,
+# 所以「查重訊」查得到、資料不斷。指令回覆(reply)本就免費、不受影響。
+_push_enabled = os.environ.get("PUSH_ENABLED", "1").strip() != "0"
+_PUSH_OFF_WORDS = {"推播關閉", "關閉推播", "推播暫停", "暫停推播", "推播關", "關推播"}
+_PUSH_ON_WORDS = {"推播開啟", "開啟推播", "恢復推播", "推播開", "開推播"}
+_PUSH_STATUS_WORDS = {"推播狀態", "推播設定"}
+
+
+def is_push_enabled() -> bool:
+    return _push_enabled
+
+
+def set_push_enabled(on: bool) -> None:
+    global _push_enabled
+    _push_enabled = on
+
+
+def is_push_toggle_command(text: str) -> str | None:
+    """整段字比對;回 'off'/'on'/'status' 或 None。"""
+    s = (text or "").strip()
+    if s in _PUSH_OFF_WORDS:
+        return "off"
+    if s in _PUSH_ON_WORDS:
+        return "on"
+    if s in _PUSH_STATUS_WORDS:
+        return "status"
+    return None
+
+
+def run_push_toggle(action: str) -> str:
+    if action == "off":
+        set_push_enabled(False)
+        return (
+            "🔕 已暫停所有主動推播(早報/週報/MOPS 警示),不再消耗 LINE 額度。\n"
+            "背景仍在掃描記錄——隨時打「早報」「下週」「查重訊今天」都查得到(免費)。\n"
+            "要恢復打「推播開啟」。"
+        )
+    if action == "on":
+        set_push_enabled(True)
+        return "🔔 已恢復主動推播(早報/週報/MOPS 警示)。"
+    return f"主動推播目前:{'開啟中 🔔' if _push_enabled else '暫停中 🔕'}\n(關:推播關閉／開:推播開啟)"
+
+
+def is_today_brief_command(text: str) -> bool:
+    return (text or "").strip() in {"早報", "今日", "今日行事曆", "今日重點", "當日行事曆"}
+
+
+def run_today_brief() -> str:
+    """打「早報」即時叫出今日行事曆+法說會預告(等同 08:30 推播內容,但用 reply 不計額度)。"""
+    msg = notify_daily(dry_run=True)
+    if not msg:
+        today = datetime.datetime.now(TW_TZ).date()
+        return f"🌅 今日行事曆 {today.month}/{today.day}\n\n(今天沒有排定事件,近日也沒有法說會預告)"
+    return msg
+
+
 # ---- 推播到 LINE ----
 def push(text: str, target_id: str = "") -> None:
+    if not _push_enabled:
+        logger.info("主動推播已暫停(PUSH_ENABLED/指令),略過。")
+        return
     target = target_id or _target_id()
     if not target:
         logger.warning("未設定 LINE_NOTIFY_TARGET_ID,略過推播。訊息內容:\n%s", text)

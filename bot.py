@@ -101,6 +101,16 @@ def _reply_list_events(reply_token: str, user_id: str, text: str) -> None:
         _say(reply_token, user_id, reply)
 
 
+# ---- 背景執行「早報」(今日行事曆+法說會預告)並回覆 ----
+def _reply_today_brief(reply_token: str, user_id: str, text: str) -> None:
+    try:
+        reply = calendar_notify.run_today_brief()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("早報失敗")
+        reply = f"❌ 早報失敗:{e}"
+    _say(reply_token, user_id, reply)
+
+
 # ---- 背景執行「用量」報告並回覆 ----
 def _reply_usage(reply_token: str, user_id: str, text: str) -> None:
     try:
@@ -123,7 +133,7 @@ def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-07-22-econ-nextmonth"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-07-22-push-toggle"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
@@ -162,6 +172,22 @@ def callback():
             if room_id:
                 lines.append(f"\n本聊天室 room id(推播目標請用這個):\n{room_id}")
             _say(reply_token, user_id, "\n".join(lines))
+            continue
+
+        # 「推播開啟/關閉/狀態」總開關:僅本人私訊可改(config 變更)
+        toggle = calendar_notify.is_push_toggle_command(text)
+        if toggle:
+            if not ALLOWED_USER_ID or user_id == ALLOWED_USER_ID:
+                _say(reply_token, user_id, calendar_notify.run_push_toggle(toggle))
+            continue
+
+        # 「早報/今日」→ 即時叫出今日行事曆+法說會預告(reply,不計額度),唯讀群組私訊都可
+        if calendar_notify.is_today_brief_command(text):
+            threading.Thread(
+                target=_reply_today_brief,
+                args=(reply_token, user_id, text),
+                daemon=True,
+            ).start()
             continue
 
         # 「用量」報告:LINE 推播則數 + Firecrawl credit + AI token 即時用量,唯讀
