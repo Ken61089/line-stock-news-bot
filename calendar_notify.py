@@ -124,7 +124,7 @@ def format_daily(events: list[dict], day: datetime.date,
 
 
 def format_earnings_preview(events: list[dict], today: datetime.date) -> str:
-    """法說會提前預告區塊,依日期排序,標倒數天數。"""
+    """提前預告區塊(法說會/財報公布),依日期排序,標倒數天數。"""
     lines = []
     for ev in sorted(events, key=lambda e: e["start"]):
         try:
@@ -136,7 +136,7 @@ def format_earnings_preview(events: list[dict], today: datetime.date) -> str:
         w = _WEEKDAY_ZH[dd.weekday()]
         emoji = TYPE_EMOJI.get(ev["type"], "🎤")
         lines.append(f"{emoji} {dd.month}/{dd.day}(週{w}・{when}) {ev['title']}")
-    return "📢 法說會預告\n" + "\n".join(lines)
+    return "📢 近期預告(法說會/財報)\n" + "\n".join(lines)
 
 
 # ---- 隨選「列出事件」:本週/下週/指定日期或範圍 ----
@@ -459,9 +459,10 @@ def push(text: str, target_id: str = "") -> None:
     logger.info("已推播到 %s(%d 字)", target[:8] + "…", len(text))
 
 
-# 法說會提前預告:當天 + 前幾天都通知(預設 2 = 當天+前2天共 3 個早上)
+# 提前預告:當天 + 前幾天都通知(預設 2 = 當天+前2天共 3 個早上)
+# 註:變數名叫 EARNINGS_LEAD_DAYS,但預告對象由 _PREVIEW_TYPES 決定(法說會 + 財報公布)
 EARNINGS_LEAD_DAYS = int(os.environ.get("EARNINGS_LEAD_DAYS", "2"))
-_PREVIEW_TYPES = {"法說會"}
+_PREVIEW_TYPES = {"法說會", "財報公布"}
 
 
 def format_notes(notes: list[dict], day: datetime.date) -> str:
