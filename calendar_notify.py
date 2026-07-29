@@ -479,7 +479,7 @@ def format_notes(notes: list[dict], day: datetime.date) -> str:
 _STOCKINFO_NEWS = {"個股新聞", "產業新聞", "個股產業報告"}
 _STOCKINFO_ALERT = {"重大訊息"}
 _STOCKINFO_SKIP = {"每日關注", "隨手筆記", "盤後隨筆"}
-_STOCKINFO_EACH = 5  # 每組最多列幾則
+_STOCKINFO_EACH = {"news": 5, "event": 8, "alert": 5}  # 每組最多列幾則(事件含未來時程,放寬)
 
 
 def is_stock_info_command(text: str) -> bool:
@@ -562,16 +562,25 @@ def run_stock_info(text: str) -> str:
         group = [e for e in items if _stockinfo_group(e["type"]) == gkey]
         if not group:
             continue
+        cap = _STOCKINFO_EACH.get(gkey, 5)
         lines.append("")
         lines.append(head)
-        for ev in group[:_STOCKINFO_EACH]:
+        this_year = datetime.datetime.now(TW_TZ).year
+        for ev in group[:cap]:
             n = items.index(ev) + 1
-            md = ev["date"][5:10].replace("-", "/") if len(ev["date"]) >= 10 else ev["date"]
+            d = ev["date"]
+            if len(d) >= 10:
+                # 非今年的事件(多為未來時程)標出年份,避免只看 MM/DD 誤判
+                md = d[5:10].replace("-", "/")
+                if d[:4] != str(this_year):
+                    md = f"{d[2:4]}/{md}"
+            else:
+                md = d
             title = _strip_label_prefix(ev["title"], label)
             mark = "" if gkey == "alert" else f"[{ev['type']}] "
             lines.append(f"[{n}] {md} {mark}{title[:24]}")
-        if len(group) > _STOCKINFO_EACH:
-            lines.append(f"…另有 {len(group) - _STOCKINFO_EACH} 則")
+        if len(group) > cap:
+            lines.append(f"…另有 {len(group) - cap} 則")
     lines.append("")
     lines.append(f"看內文:股訊 {key} 編號")
     return "\n".join(lines)
