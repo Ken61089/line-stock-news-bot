@@ -580,26 +580,31 @@ def is_margin_command(text: str) -> bool:
 
 
 def run_margin_query(text: str) -> str:
-    """處理「融資 / 融資 7/28」指令,回可直接 reply 的字串。"""
+    """處理「融資 7/28」指令,回可 reply 的字串。
+    只打「融資」或看不懂的參數 → 回空字串(不回覆,避免誤觸);「融資 用法」→ 用法說明。"""
     t = (text or "").strip()
     arg = ""
     for prefix in ("融資餘額", "融資"):
         if t.startswith(prefix):
             arg = t[len(prefix):].strip()
             break
+    if not arg:
+        return ""  # 只打「融資」→ 不回覆,避免一直誤觸
+    if arg in ("用法", "help", "?", "？"):
+        return ("📊 融資餘額查詢用法\n"
+                "打「融資 日期」查該日兩市融資餘額增減\n"
+                "日期:融資 7/28、融資 20260728、融資 2026-07-28、融資 115/07/28")
     try:
         date = _parse_margin_date(arg)
-    except ValueError as e:
-        return f"⚠️ {e}\n用法:融資 / 融資 7/28 / 融資 20260728"
+    except ValueError:
+        return ""  # 看不懂日期 → 不回覆,避免誤觸
     try:
         info = fetch_margin_change(date)
     except Exception as e:  # noqa: BLE001
         logger.exception("融資餘額查詢失敗")
         return f"❌ 融資查詢失敗:{e}"
     if not info:
-        if date:
-            return f"📊 {date:%m/%d} 查無融資餘額資料(可能非交易日),換一天試試"
-        return "📊 近期查無融資餘額資料,請稍後再試"
+        return f"📊 {date:%m/%d} 查無融資餘額資料(可能非交易日),換一天試試"
 
     def _arrow(x):
         return "▲" if x > 0 else ("▼" if x < 0 else "－")
