@@ -27,6 +27,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 from news_processor import route_and_store, NoCategoryError, is_group_additive_command
 import calendar_notify
+import fetchers
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -90,6 +91,17 @@ def _process_and_reply(reply_token: str, user_id: str, text: str) -> None:
     _say(reply_token, user_id, result.reply)
 
 
+# ---- 背景執行「融資」查詢(兩市融資餘額增減)並回覆 ----
+def _reply_margin(reply_token: str, user_id: str, text: str) -> None:
+    try:
+        reply = fetchers.run_margin_query(text)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("融資查詢失敗")
+        reply = f"❌ 融資查詢失敗:{e}"
+    if reply:
+        _say(reply_token, user_id, reply)
+
+
 # ---- 背景執行「列出事件」查詢並回覆 ----
 def _reply_list_events(reply_token: str, user_id: str, text: str) -> None:
     try:
@@ -133,7 +145,7 @@ def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-07-29-mops-quiet"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-07-29-margin-query"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
@@ -194,6 +206,15 @@ def callback():
         if calendar_notify.is_usage_command(text):
             threading.Thread(
                 target=_reply_usage,
+                args=(reply_token, user_id, text),
+                daemon=True,
+            ).start()
+            continue
+
+        # 「融資」查兩市融資餘額增減(可帶日期,如「融資 7/28」):唯讀,群組與私訊都可用
+        if fetchers.is_margin_command(text):
+            threading.Thread(
+                target=_reply_margin,
                 args=(reply_token, user_id, text),
                 daemon=True,
             ).start()

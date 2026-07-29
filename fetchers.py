@@ -491,6 +491,133 @@ def _roc_to_iso(roc: str) -> str:
         return datetime.datetime.now(TW_TZ).date().isoformat()
 
 
+# ==== 融資餘額增減查詢(上市 TWSE + 上櫃 TPEx,查詢式、reply、不推播)====
+_MARGIN_UA = {"User-Agent": "Mozilla/5.0"}
+
+
+def _margin_num(s) -> int:
+    """'545,533,645' → 545533645;空值→0。"""
+    return int(str(s).replace(",", "").strip() or 0)
+
+
+def _twse_margin_bal(date: datetime.date):
+    """上市:回 (前日餘額, 今日餘額) 融資金額仟元;查無資料回 None。"""
+    url = ("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
+           f"?date={date:%Y%m%d}&selectType=ALL&response=json")
+    j = httpx.get(url, timeout=20, headers=_MARGIN_UA).json()
+    if j.get("stat") != "OK" or not j.get("tables"):
+        return None
+    for r in j["tables"][0].get("data", []):  # 信用交易統計:找「融資金額(仟元)」列
+        if r and "融資" in str(r[0]) and "金額" in str(r[0]):
+            return _margin_num(r[4]), _margin_num(r[5])  # 前日餘額, 今日餘額
+    return None
+
+
+def _tpex_margin_bal(date: datetime.date):
+    """上櫃:回 (前資餘額, 資餘額) 融資金仟元;查無資料回 None。"""
+    url = ("https://www.tpex.org.tw/www/zh-tw/margin/balance"
+           f"?date={date:%Y/%m/%d}&response=json")
+    j = httpx.get(url, timeout=20, headers=_MARGIN_UA).json()
+    tables = j.get("tables") or []
+    if not tables or not tables[0].get("totalCount"):  # 非交易日 totalCount=0
+        return None
+    for r in tables[0].get("summary", []):  # summary 裡的「融資金(仟元)」合計列
+        if len(r) > 6 and str(r[1]).startswith("融資金"):
+            return _margin_num(r[2]), _margin_num(r[6])  # 前資餘額, 資餘額
+    return None
+
+
+def fetch_margin_change(date=None, lookback: int = 10):
+    """融資餘額增減(金額,仟元)。date=None → 從今天往回找最近有資料的交易日;
+    指定 date 只查那天。回 dict(含兩市前/今餘額與增減、合計)或 None(找不到)。"""
+    start = date or datetime.datetime.now(TW_TZ).date()
+    span = 1 if date else lookback
+    for i in range(span):
+        d = start - datetime.timedelta(days=i)
+        tw = _twse_margin_bal(d)
+        tp = _tpex_margin_bal(d)
+        if tw and tp:
+            return {
+                "date": d,
+                "twse_prev": tw[0], "twse_today": tw[1], "twse_chg": tw[1] - tw[0],
+                "tpex_prev": tp[0], "tpex_today": tp[1], "tpex_chg": tp[1] - tp[0],
+                "total_chg": (tw[1] - tw[0]) + (tp[1] - tp[0]),
+            }
+    return None
+
+
+def _parse_margin_date(arg: str):
+    """使用者輸入 → date;空字串回 None(=最近交易日)。無法解析 raise ValueError。
+    接受:7/28、07/28(當年)、2026/07/28、2026-07-28、20260728、115/07/28(民國)。"""
+    s = arg.strip().replace("-", "/").replace(".", "/")
+    if not s:
+        return None
+    if s.isdigit() and len(s) == 8:  # YYYYMMDD
+        return datetime.date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+    parts = [p for p in s.split("/") if p]
+    try:
+        if len(parts) == 2:  # MM/DD → 當年
+            today = datetime.datetime.now(TW_TZ).date()
+            return datetime.date(today.year, int(parts[0]), int(parts[1]))
+        if len(parts) == 3:
+            y, m, d = int(parts[0]), int(parts[1]), int(parts[2])
+            if y < 1911:  # 民國年
+                y += 1911
+            return datetime.date(y, m, d)
+    except ValueError:
+        pass
+    raise ValueError(f"看不懂日期「{arg}」")
+
+
+def _yi(thousand_ntd: int) -> float:
+    """仟元 → 億元(1 億 = 100,000 仟元)。"""
+    return thousand_ntd / 100000
+
+
+def is_margin_command(text: str) -> bool:
+    t = (text or "").strip()
+    return t == "融資" or t.startswith("融資 ") or t.startswith("融資餘額")
+
+
+def run_margin_query(text: str) -> str:
+    """處理「融資 / 融資 7/28」指令,回可直接 reply 的字串。"""
+    t = (text or "").strip()
+    arg = ""
+    for prefix in ("融資餘額", "融資"):
+        if t.startswith(prefix):
+            arg = t[len(prefix):].strip()
+            break
+    try:
+        date = _parse_margin_date(arg)
+    except ValueError as e:
+        return f"⚠️ {e}\n用法:融資 / 融資 7/28 / 融資 20260728"
+    try:
+        info = fetch_margin_change(date)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("融資餘額查詢失敗")
+        return f"❌ 融資查詢失敗:{e}"
+    if not info:
+        if date:
+            return f"📊 {date:%m/%d} 查無融資餘額資料(可能非交易日),換一天試試"
+        return "📊 近期查無融資餘額資料,請稍後再試"
+
+    def _arrow(x):
+        return "▲" if x > 0 else ("▼" if x < 0 else "－")
+
+    def _row(name, chg, today):
+        return f"{name} {_yi(chg):+,.2f} 億 {_arrow(chg)}  (餘額 {_yi(today):,.0f} 億)"
+
+    d = info["date"]
+    return (
+        f"📊 融資餘額增減｜{d:%m/%d}\n"
+        "─────────────\n"
+        f"{_row('上市', info['twse_chg'], info['twse_today'])}\n"
+        f"{_row('上櫃', info['tpex_chg'], info['tpex_today'])}\n"
+        "─────────────\n"
+        f"合計 {_yi(info['total_chg']):+,.2f} 億 {_arrow(info['total_chg'])}"
+    )
+
+
 if __name__ == "__main__":
     import sys
 
