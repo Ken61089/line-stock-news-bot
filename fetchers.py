@@ -456,7 +456,12 @@ def check_mops_alerts() -> dict:
         lines = ["🚨 重大訊息(追蹤股)"]
         for r in hits:
             lines.append(f"\n{r['code']} {r['name']}  {r['time']}\n{r['subject'][:180]}")
-        _push_line("\n".join(lines))
+        # MOPS 命中預設「只記 Notion、不推 LINE」(省 LINE 額度;用「查重訊」pull 補看)。
+        # 要恢復命中即時推播:設 env MOPS_ALERT_PUSH=1
+        if os.environ.get("MOPS_ALERT_PUSH", "0").strip() != "0":
+            _push_line("\n".join(lines))
+        else:
+            logger.info("MOPS 命中 %d 檔,MOPS_ALERT_PUSH 關閉,只記 Notion 不推播", len(hits))
         # 同時存進 Notion(事件類型「重大訊息」)→ 之後可用「查重訊」查區間
         for r in hits:
             st = by_code[r["code"]]
