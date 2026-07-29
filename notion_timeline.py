@@ -323,6 +323,37 @@ def find_stock_page(code: str, name: str = "") -> dict | None:
     return None
 
 
+def list_events_by_stock(stock_page_id: str, limit: int = 60) -> list[dict]:
+    """查某檔個股關聯的時程事件(新→舊),回 [{'title','type','date','note','link'}]。
+    note=Quick Note 全文(新聞摘要與【關鍵時程】就存在這裡),供「股訊」展開單則用。"""
+    data = _post(
+        f"/data_sources/{TIMELINE_DS}/query",
+        {
+            "filter": {"property": "🔗 關聯個股", "relation": {"contains": stock_page_id}},
+            "sorts": [{"property": "關鍵日期", "direction": "descending"}],
+            "page_size": min(limit, 100),
+        },
+    )
+    out = []
+    for pg in data.get("results", []):
+        props = pg.get("properties", {})
+        title = "".join(
+            t.get("plain_text", "") for t in props.get("Name", {}).get("title", [])
+        ).strip()
+        note = "".join(
+            t.get("plain_text", "") for t in props.get("Quick Note", {}).get("rich_text", [])
+        ).strip()
+        out.append({
+            "id": pg["id"],
+            "title": title,
+            "type": (props.get("事件類型", {}).get("select") or {}).get("name", ""),
+            "date": (props.get("關鍵日期", {}).get("date") or {}).get("start", "") or "",
+            "note": note,
+            "link": props.get("來源連結", {}).get("url", "") or "",
+        })
+    return out
+
+
 def create_stock_page(code: str, name: str) -> dict:
     """在個股主表新增一檔(只填 Name,格式「代號 名稱」)。回傳 {'id','label','concept_ids':[]}。"""
     code = (code or "").strip()

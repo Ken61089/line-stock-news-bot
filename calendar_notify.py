@@ -474,6 +474,93 @@ def format_notes(notes: list[dict], day: datetime.date) -> str:
     return f"{head}\n{body}"
 
 
+# ---- 「股訊」查個股已存新聞/事件(唯讀 reply,不計額度)----
+# 分組:新聞報告 / 事件(法說會、財報等) / 重大訊息;盯盤與隨筆類不列入。
+_STOCKINFO_NEWS = {"個股新聞", "產業新聞", "個股產業報告"}
+_STOCKINFO_ALERT = {"重大訊息"}
+_STOCKINFO_SKIP = {"每日關注", "隨手筆記", "盤後隨筆"}
+_STOCKINFO_EACH = 5  # 每組最多列幾則
+
+
+def is_stock_info_command(text: str) -> bool:
+    t = (text or "").strip()
+    return t.startswith("股訊 ") or t == "股訊"
+
+
+def _stockinfo_group(event_type: str) -> str:
+    if event_type in _STOCKINFO_NEWS:
+        return "news"
+    if event_type in _STOCKINFO_ALERT:
+        return "alert"
+    if event_type in _STOCKINFO_SKIP:
+        return "skip"
+    return "event"
+
+
+def _strip_label_prefix(title: str, label: str) -> str:
+    """重訊標題常以「2303 聯電 …」開頭,列表已標明個股,去掉重複前綴。"""
+    for pre in (label + " ", label):
+        if pre and title.startswith(pre):
+            return title[len(pre):].strip()
+    return title
+
+
+def run_stock_info(text: str) -> str:
+    """「股訊 2303」→ 分組列表(帶編號);「股訊 2303 2」→ 展開第 2 則全文。
+    只打「股訊」或查無關鍵字 → 回空字串(不回覆,避免誤觸)。"""
+    arg = (text or "").strip()[len("股訊"):].strip()
+    if not arg:
+        return ""
+    parts = arg.split()
+    key = parts[0]
+    idx = 0
+    if len(parts) > 1 and parts[1].isdigit():
+        idx = int(parts[1])
+
+    stock = nt.find_stock_page(key, key)
+    if not stock:
+        return f"📄 個股主表查無「{key}」,可能還沒建檔"
+    label = stock["label"]
+    events = nt.list_events_by_stock(stock["id"])
+    items = [e for e in events if _stockinfo_group(e["type"]) != "skip"]
+    if not items:
+        return f"📄 {label} 目前沒有已存訊息"
+
+    # 依組別重排(新聞→事件→重訊),編號跨組連續,讓「股訊 代號 N」可直接指定
+    order = {"news": 0, "event": 1, "alert": 2}
+    items.sort(key=lambda e: (order[_stockinfo_group(e["type"])], ), reverse=False)
+
+    if idx:  # 展開單則
+        if idx > len(items):
+            return f"📄 {label} 只有 {len(items)} 則,查無第 {idx} 則"
+        ev = items[idx - 1]
+        d = ev["date"][:10] or "(無日期)"
+        head = f"📄 {label}｜[{idx}] {ev['type']}\n{d} {_strip_label_prefix(ev['title'], label)}"
+        body = ev["note"] or "(這則沒有存摘要內容)"
+        tail = f"\n\n🔗 {ev['link']}" if ev["link"] else ""
+        return f"{head}\n{'─' * 13}\n{body[:3500]}{tail}"
+
+    lines = [f"📄 {label}｜最近訊息"]
+    n = 0
+    for gkey, head in (("news", "📰 新聞/報告"), ("event", "📅 事件"), ("alert", "🚨 重大訊息")):
+        group = [e for e in items if _stockinfo_group(e["type"]) == gkey]
+        if not group:
+            continue
+        lines.append("")
+        lines.append(head)
+        for ev in group[:_STOCKINFO_EACH]:
+            n = items.index(ev) + 1
+            md = ev["date"][5:10].replace("-", "/") if len(ev["date"]) >= 10 else ev["date"]
+            title = _strip_label_prefix(ev["title"], label)
+            mark = "" if gkey == "alert" else f"[{ev['type']}] "
+            lines.append(f"[{n}] {md} {mark}{title[:24]}")
+        if len(group) > _STOCKINFO_EACH:
+            lines.append(f"…另有 {len(group) - _STOCKINFO_EACH} 則")
+    lines.append("")
+    lines.append(f"看內文:股訊 {key} 編號")
+    return "\n".join(lines)
+
+
 # ---- 排程任務 ----
 def notify_daily(dry_run: bool = False) -> str | None:
     today = datetime.datetime.now(TW_TZ).date()
