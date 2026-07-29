@@ -497,6 +497,22 @@ def _stockinfo_group(event_type: str) -> str:
     return "event"
 
 
+def _clean_note(note: str) -> str:
+    """去掉 Quick Note 開頭的標籤雜訊行(如「市場:台股」),只留真正的摘要內容。"""
+    lines = note.splitlines()
+    while lines:
+        first = lines[0].strip()
+        if not first:
+            lines.pop(0)
+            continue
+        # 短行且形如「欄位:值」的標籤(如 市場:台股)→ 視為雜訊丟掉
+        if len(first) <= 14 and ("：" in first or ":" in first):
+            lines.pop(0)
+            continue
+        break
+    return "\n".join(lines).strip()
+
+
 def _strip_label_prefix(title: str, label: str) -> str:
     """重訊標題常以「2303 聯電 …」開頭,列表已標明個股,去掉重複前綴。"""
     for pre in (label + " ", label):
@@ -536,7 +552,7 @@ def run_stock_info(text: str) -> str:
         ev = items[idx - 1]
         d = ev["date"][:10] or "(無日期)"
         head = f"📄 {label}｜[{idx}] {ev['type']}\n{d} {_strip_label_prefix(ev['title'], label)}"
-        body = ev["note"] or "(這則沒有存摘要內容)"
+        body = _clean_note(ev["note"]) or "(這則沒有存摘要內容)"
         tail = f"\n\n🔗 {ev['link']}" if ev["link"] else ""
         return f"{head}\n{'─' * 13}\n{body[:3500]}{tail}"
 
