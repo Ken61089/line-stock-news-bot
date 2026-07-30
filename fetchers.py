@@ -12,6 +12,7 @@
 
 import os
 import re
+import time
 import logging
 import datetime
 
@@ -500,13 +501,41 @@ def _margin_num(s) -> int:
     return int(str(s).replace(",", "").strip() or 0)
 
 
+class MarginBusyError(RuntimeError):
+    """上游(TWSE/TPEx)限流或暫時無回應,與「該日真的沒資料」不同。"""
+
+
+def _margin_json(url: str, tries: int = 3) -> dict:
+    """抓 JSON,容忍 TWSE/TPEx 限流:空 body 或非 JSON 時退避重試。
+    ⚠️TWSE 被限流時會回空 body(json() 直接噴 JSONDecodeError),重試後才拿得到資料。"""
+    last = ""
+    for i in range(tries):
+        if i:
+            time.sleep(1.5 * i)  # 1.5s、3s 退避
+        try:
+            r = httpx.get(url, timeout=25, headers=_MARGIN_UA)
+            body = (r.text or "").strip()
+            if body.startswith("{"):
+                return r.json()
+            last = f"HTTP {r.status_code} 空回應" if not body else f"非 JSON:{body[:60]}"
+        except (httpx.HTTPError, ValueError) as e:
+            last = f"{type(e).__name__}: {e}"
+        logger.warning("融資資料抓取第 %d 次失敗(%s):%s", i + 1, url[:50], last)
+    raise MarginBusyError(last or "無回應")
+
+
 def _twse_margin_bal(date: datetime.date):
     """上市:回 (前日餘額, 今日餘額) 融資金額仟元;查無資料回 None。"""
     url = ("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
            f"?date={date:%Y%m%d}&selectType=ALL&response=json")
-    j = httpx.get(url, timeout=20, headers=_MARGIN_UA).json()
+    j = _margin_json(url)
     if j.get("stat") != "OK" or not j.get("tables"):
-        return None
+        # ⚠️TWSE 被限流時也回「很抱歉,沒有符合條件的資料」,與真的非交易日長得一樣
+        # → 再等一下重查一次,兩次都沒有才當作真的沒資料
+        time.sleep(2.5)
+        j = _margin_json(url)
+        if j.get("stat") != "OK" or not j.get("tables"):
+            return None
     for r in j["tables"][0].get("data", []):  # 信用交易統計:找「融資金額(仟元)」列
         if r and "融資" in str(r[0]) and "金額" in str(r[0]):
             return _margin_num(r[4]), _margin_num(r[5])  # 前日餘額, 今日餘額
@@ -517,7 +546,7 @@ def _tpex_margin_bal(date: datetime.date):
     """上櫃:回 (前資餘額, 資餘額) 融資金仟元;查無資料回 None。"""
     url = ("https://www.tpex.org.tw/www/zh-tw/margin/balance"
            f"?date={date:%Y/%m/%d}&response=json")
-    j = httpx.get(url, timeout=20, headers=_MARGIN_UA).json()
+    j = _margin_json(url)
     tables = j.get("tables") or []
     if not tables or not tables[0].get("totalCount"):  # 非交易日 totalCount=0
         return None
@@ -600,6 +629,9 @@ def run_margin_query(text: str) -> str:
         return ""  # 看不懂日期 → 不回覆,避免誤觸
     try:
         info = fetch_margin_change(date)
+    except MarginBusyError:
+        logger.warning("融資資料來源忙碌/限流,已重試仍失敗")
+        return "⏳ 證交所/櫃買資料暫時取不到(可能查詢過於頻繁),稍等一下再打一次"
     except Exception as e:  # noqa: BLE001
         logger.exception("融資餘額查詢失敗")
         return f"❌ 融資查詢失敗:{e}"
