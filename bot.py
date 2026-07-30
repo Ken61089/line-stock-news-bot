@@ -102,6 +102,17 @@ def _reply_stock_info(reply_token: str, user_id: str, text: str) -> None:
         _say(reply_token, user_id, reply)
 
 
+# ---- 背景執行「營收」查詢(公布日曆預估)並回覆 ----
+def _reply_revenue(reply_token: str, user_id: str, text: str) -> None:
+    try:
+        reply = fetchers.run_revenue_query(text)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("營收查詢失敗")
+        reply = f"❌ 營收查詢失敗:{e}"
+    if reply:
+        _say(reply_token, user_id, reply)
+
+
 # ---- 背景執行「融資」查詢(兩市融資餘額增減)並回覆 ----
 def _reply_margin(reply_token: str, user_id: str, text: str) -> None:
     try:
@@ -156,7 +167,7 @@ def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-07-30-margin-retry"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-07-30-revenue-calendar"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
@@ -226,6 +237,15 @@ def callback():
         if calendar_notify.is_stock_info_command(text):
             threading.Thread(
                 target=_reply_stock_info,
+                args=(reply_token, user_id, text),
+                daemon=True,
+            ).start()
+            continue
+
+        # 「營收日曆」/「營收 2330」查月營收公布日預估:唯讀,群組與私訊都可用
+        if fetchers.is_revenue_command(text):
+            threading.Thread(
+                target=_reply_revenue,
                 args=(reply_token, user_id, text),
                 daemon=True,
             ).start()

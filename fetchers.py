@@ -15,6 +15,8 @@ import re
 import time
 import logging
 import datetime
+import statistics
+import collections
 
 import httpx
 
@@ -505,17 +507,18 @@ class MarginBusyError(RuntimeError):
     """上游(TWSE/TPEx)限流或暫時無回應,與「該日真的沒資料」不同。"""
 
 
-def _margin_json(url: str, tries: int = 3) -> dict:
-    """抓 JSON,容忍 TWSE/TPEx 限流:空 body 或非 JSON 時退避重試。
-    ⚠️TWSE 被限流時會回空 body(json() 直接噴 JSONDecodeError),重試後才拿得到資料。"""
+def _margin_json(url: str, tries: int = 3, headers: dict | None = None):
+    """抓 JSON(物件或陣列),容忍 TWSE/TPEx 限流:空 body 或非 JSON 時退避重試。
+    ⚠️TWSE 被限流時會回空 body(json() 直接噴 JSONDecodeError),重試後才拿得到資料。
+    ⚠️TPEx OpenAPI 偶發 RemoteProtocolError,需帶 Connection: close(見 _REV_HEADERS)。"""
     last = ""
     for i in range(tries):
         if i:
             time.sleep(1.5 * i)  # 1.5s、3s 退避
         try:
-            r = httpx.get(url, timeout=25, headers=_MARGIN_UA)
+            r = httpx.get(url, timeout=30, headers=headers or _MARGIN_UA)
             body = (r.text or "").strip()
-            if body.startswith("{"):
+            if body[:1] in ("{", "["):
                 return r.json()
             last = f"HTTP {r.status_code} 空回應" if not body else f"非 JSON:{body[:60]}"
         except (httpx.HTTPError, ValueError) as e:
@@ -653,6 +656,218 @@ def run_margin_query(text: str) -> str:
         "─────────────\n"
         f"合計 {_yi(info['total_chg']):+,.2f} 億 {_arrow(info['total_chg'])}"
     )
+
+
+# ==== 月營收公布日曆(每日快照差分,學各公司的公布日習慣)====
+# 官方沒有「各公司公告日」欄位(出表日期兩市全部同一值=報表產生日),
+# 只能每天抓一次全市場彙總,記下每檔「第一次出現該月份資料」的日期 = 實際公告日。
+_REV_TWSE = "https://openapi.twse.com.tw/v1/opendata/t187ap05_L"
+_REV_TPEX = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap05_O"
+_REV_HEADERS = {**_MARGIN_UA, "Connection": "close"}  # TPEx 不加會偶發 RemoteProtocolError
+_REV_MIN_SAMPLES = 3      # 少於這期數不做預估
+_REV_FLIP_RATIO = 0.6     # 同一天首見佔比超過此值 → 疑似整月批次翻轉,該月不可用
+
+
+def fetch_revenue_all() -> dict:
+    """抓上市+上櫃月營收彙總,回 {代碼: {'ym','name','rev','yoy'}}。ym=資料年月(民國,如 11507)。"""
+    out: dict[str, dict] = {}
+    for url in (_REV_TWSE, _REV_TPEX):
+        rows = _margin_json(url, headers=_REV_HEADERS)
+        for r in rows or []:
+            code = str(r.get("公司代號") or "").strip()
+            ym = str(r.get("資料年月") or "").strip()
+            if not code or not ym:
+                continue
+            out[code] = {
+                "ym": ym,
+                "name": str(r.get("公司名稱") or "").strip(),
+                "rev": str(r.get("營業收入-當月營收") or "").strip(),
+                "yoy": str(r.get("營業收入-去年同月增減(%)") or "").strip(),
+            }
+    return out
+
+
+def _roc_month(d: datetime.date) -> str:
+    """該日對應「應公布的資料年月」= 上個月,民國格式如 11507。"""
+    y, m = (d.year, d.month - 1) if d.month > 1 else (d.year - 1, 12)
+    return f"{y - 1911}{m:02d}"
+
+
+def _rev_confidence(entries: dict, day: int) -> str:
+    """依分布判斷該月資料可不可信。entries={code:{'day','censored'}}。"""
+    if not entries:
+        return "累積中"
+    days = collections.Counter(v["day"] for v in entries.values())
+    if days.most_common(1)[0][1] / len(entries) > _REV_FLIP_RATIO:
+        # 絕大多數同一天首見 → 來源可能是整月批次翻轉,而非逐日更新
+        return "低-疑似批次翻轉"
+    if sum(1 for v in entries.values() if v["censored"]) / len(entries) > 0.5:
+        return "低-首月censored"
+    return "可用" if day >= 15 else "累積中"
+
+
+def sync_revenue_calendar(target_month: str = "", today: datetime.date | None = None) -> dict:
+    """每日任務:抓兩市營收,把「第一次出現目標月份資料」的公司記進 Notion。
+    冪等:同一天重跑不會重複寫入(已記錄的代碼直接跳過)。"""
+    today = today or datetime.datetime.now(TW_TZ).date()
+    if not target_month and today.day > 20:
+        logger.info("營收日曆:%s 非公布期(>20 日),略過", today)
+        return {"skipped": True, "month": "", "new": 0, "total": 0}
+    month = target_month or _roc_month(today)
+
+    all_rev = fetch_revenue_all()
+    rec = nt.read_revenue_month(month)
+    if rec is None:
+        page_id = nt.create_revenue_month(month, today.isoformat())
+        existing, last_sync = {}, ""
+    else:
+        page_id, existing, last_sync = rec["page_id"], rec["entries"], rec["last_update"]
+
+    # censored:首次快照(1 號以後才開始記)或中間斷過 → 只知「不晚於今天」,不是精確公告日
+    censored = True
+    if last_sync:
+        try:
+            censored = (today - datetime.date.fromisoformat(last_sync[:10])).days > 1
+        except ValueError:
+            censored = True
+    elif rec is None and today.day == 1:
+        censored = False  # 1 號就開始記,沒有漏掉的區間
+
+    new_items, new_map = [], {}
+    for code, info in all_rev.items():
+        if info["ym"] != month or code in existing:
+            continue
+        new_items.append(nt._rev_entry_str(code, today.day, censored))
+        new_map[code] = {"day": today.day, "censored": censored}
+
+    nt.append_revenue_entries(page_id, sorted(new_items))
+    combined = {**existing, **new_map}
+    nt.update_revenue_month_props(
+        page_id, len(combined), _rev_confidence(combined, today.day), today.isoformat()
+    )
+    logger.info("營收日曆 %s:新增 %d 家,累計 %d 家%s",
+                month, len(new_items), len(combined), "(censored)" if censored else "")
+    return {"skipped": False, "month": month, "new": len(new_items),
+            "total": len(combined), "censored": censored}
+
+
+# ---- 依歷史推估各檔公布日 ----
+_rev_hist: dict = {"at": None, "data": {}}
+_REV_HIST_TTL = 6 * 3600  # 一天只變一次,快取 6 小時(讀全部月份頁要數十次 API,不能每次查詢都重讀)
+
+
+def load_revenue_history(force: bool = False) -> dict:
+    """讀所有可用月份,回 {代碼: [公布日, ...]}。排除低可信度月份與 censored 記錄。"""
+    now = time.time()
+    if not force and _rev_hist["at"] and now - _rev_hist["at"] < _REV_HIST_TTL:
+        return _rev_hist["data"]
+    hist: dict[str, list[int]] = {}
+    for m in nt.list_revenue_months():
+        if m["confidence"].startswith("低"):
+            continue  # 該月資料本身不可信(首月censored / 疑似批次翻轉)
+        rec = nt.read_revenue_month(m["month"])
+        if not rec:
+            continue
+        for code, info in rec["entries"].items():
+            if info["censored"]:
+                continue  # 只知「不晚於該日」,不是精確公告日
+            hist.setdefault(code, []).append(info["day"])
+    _rev_hist.update(at=now, data=hist)
+    return hist
+
+
+def predict_revenue_day(code: str, hist: dict | None = None) -> dict | None:
+    """回 {'day','iqr','confidence','samples'};樣本不足回 {'samples':n,'day':None}。"""
+    hist = hist if hist is not None else load_revenue_history()
+    days = sorted(hist.get(str(code).strip(), []))
+    if len(days) < _REV_MIN_SAMPLES:
+        return {"day": None, "samples": len(days), "iqr": None, "confidence": ""}
+    day = round(statistics.median(days))
+    if len(days) >= 4:
+        q1, _, q3 = statistics.quantiles(days, n=4, method="inclusive")
+        iqr = q3 - q1
+    else:
+        iqr = days[-1] - days[0]
+    conf = "高" if iqr <= 1 else ("中" if iqr <= 3 else "低")
+    return {"day": day, "samples": len(days), "iqr": round(iqr, 1), "confidence": conf}
+
+
+def is_revenue_command(text: str) -> bool:
+    t = (text or "").strip()
+    return t == "營收" or t.startswith("營收 ") or t.startswith("營收日曆")
+
+
+def _rev_usage() -> str:
+    return ("📅 營收公布日曆用法\n"
+            "・營收日曆 → 未來 7 天預估要公布的追蹤股\n"
+            "・營收日曆 8/5 → 指定日預估名單\n"
+            "・營收 2330 → 單檔預估公布日與歷史\n"
+            "(依每日快照學各公司習慣,需累積數期才有預估)")
+
+
+def run_revenue_query(text: str) -> str:
+    """「營收日曆 [日期]」/「營收 代碼」。無參數或看不懂 → 回空字串(不回覆,避免誤觸)。"""
+    t = (text or "").strip()
+    body = t[len("營收日曆"):].strip() if t.startswith("營收日曆") else t[len("營收"):].strip()
+    calendar_mode = t.startswith("營收日曆")
+    if not calendar_mode and not body:
+        return ""
+    if body in ("用法", "help", "?", "？"):
+        return _rev_usage()
+
+    try:
+        hist = load_revenue_history()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("營收歷史讀取失敗")
+        return f"❌ 營收查詢失敗:{e}"
+
+    if calendar_mode:
+        today = datetime.datetime.now(TW_TZ).date()
+        if body:
+            try:
+                target = _parse_margin_date(body)
+            except ValueError:
+                return ""
+            days = [target] if target else [today]
+        else:
+            days = [today + datetime.timedelta(days=i) for i in range(7)]
+        stocks = [s for s in nt.list_stocks() if s["code"]]
+        lines, hit = [f"📅 營收公布預估｜{'指定日' if body else '未來 7 天'}", "─" * 13], 0
+        for d in days:
+            names = []
+            for s in stocks:
+                p = predict_revenue_day(s["code"], hist)
+                if p and p["day"] == d.day:
+                    names.append(f"  {s['label']}(可信度{p['confidence']})")
+            if names:
+                hit += len(names)
+                lines.append(f"{d.month}/{d.day:02d}")
+                lines.extend(names)
+        if not hit:
+            samples = sum(1 for s in stocks if hist.get(s["code"]))
+            lines.append(f"— 無預估 —\n目前累積 {len(nt.list_revenue_months())} 期、"
+                         f"{samples} 檔追蹤股有記錄。\n需至少 {_REV_MIN_SAMPLES} 期才會出現預估。")
+        else:
+            lines.append("─" * 13)
+            lines.append("* 依歷史公布日推估,非官方公告")
+        return "\n".join(lines)
+
+    stock = nt.find_stock_page(body, body)
+    if not stock and not re.fullmatch(r"\d{3,6}[A-Za-z]?", body):
+        return ""  # 既不是主表裡的名稱、也不像股票代號 → 不回覆,避免誤觸
+    label = stock["label"] if stock else body
+    p = predict_revenue_day(body, hist)
+    days = sorted(hist.get(body, []), reverse=True)
+    if not p or p["day"] is None:
+        n = p["samples"] if p else 0
+        return (f"📅 {label} 營收公布預估\n{'─' * 13}\n"
+                f"資料不足(目前 {n} 期,需 {_REV_MIN_SAMPLES} 期)\n"
+                f"每月自動累積中,累積後即可預估")
+    return (f"📅 {label} 營收公布預估\n{'─' * 13}\n"
+            f"預估公布日:每月 {p['day']} 日\n"
+            f"可信度:{p['confidence']}(離散度 {p['iqr']} 天)\n"
+            f"樣本:{p['samples']} 期  歷史:{', '.join(f'{d}日' for d in days[:8])}\n"
+            f"{'─' * 13}\n* 依歷史推估,非官方公告")
 
 
 if __name__ == "__main__":

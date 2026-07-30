@@ -26,6 +26,8 @@ GLOBAL_DS = os.environ.get("NOTION_GLOBAL_DS", "36694cc2-76ec-469e-9e78-1d0df333
 KNOWLEDGE_DS = os.environ.get("NOTION_KNOWLEDGE_DS", "517dd7f8-6804-4048-bd0c-529a8cbe8b1a").strip()
 # AI 用量統計庫(一月一列,持久化 AI token 用量;2026-07-06 建於股票大腦母頁下)
 AI_USAGE_DS = os.environ.get("NOTION_AI_USAGE_DS", "71bdc5e1-59f0-424b-acec-4ad47076861c").strip()
+# 營收公布日曆(一月一頁,頁面內文分塊存「代碼:公布日」;2026-07-30 建於股票大腦母頁下)
+REVENUE_DS = os.environ.get("NOTION_REVENUE_DS", "1eb50a13-e713-4d18-a9ae-27b7a84a8941").strip()
 
 _API = "https://api.notion.com/v1"
 _STOCK_CODE_RE = re.compile(r"\d{3,6}")
@@ -292,6 +294,140 @@ def read_ai_usage_all() -> dict:
             break
         cursor = data.get("next_cursor")
     return {"calls": calls, "prompt": prompt, "completion": completion, "months": months}
+
+
+# ==== 營收公布日曆(一月一頁;內文分塊存「代碼:日」,只增不改)====
+# 一天 append 一塊,不重寫舊塊 → 不會動到既有資料,也省 API 呼叫。
+_REV_CHUNK = 1800  # 單一 rich_text 上限 2000,留餘裕
+
+
+def _rev_entry_str(code: str, day: int, censored: bool) -> str:
+    return f"{code}:{day:02d}{'*' if censored else ''}"
+
+
+def read_revenue_month(month: str) -> dict | None:
+    """讀某資料年月(如 '11507')的公布記錄。
+    回 {'page_id','entries':{code:{'day':int,'censored':bool}},'first_snapshot','confidence','last_update'}
+    或 None(該月尚無頁面)。"""
+    data = _post(
+        f"/data_sources/{REVENUE_DS}/query",
+        {"filter": {"property": "月份", "title": {"equals": month}}, "page_size": 1},
+    )
+    results = data.get("results", [])
+    if not results:
+        return None
+    pg = results[0]
+    props = pg.get("properties", {})
+    entries: dict[str, dict] = {}
+    cursor = None
+    while True:  # 逐塊讀回所有記錄
+        path = f"/blocks/{pg['id']}/children?page_size=100"
+        if cursor:
+            path += f"&start_cursor={cursor}"
+        blocks = _get(path)
+        for b in blocks.get("results", []):
+            if b.get("type") != "paragraph":
+                continue
+            text = "".join(
+                t.get("plain_text", "") for t in b["paragraph"].get("rich_text", [])
+            )
+            for item in text.split(","):
+                item = item.strip()
+                if not item or ":" not in item:
+                    continue
+                code, _, day = item.partition(":")
+                censored = day.endswith("*")
+                try:
+                    entries[code.strip()] = {"day": int(day.rstrip("*")), "censored": censored}
+                except ValueError:
+                    continue
+        if not blocks.get("has_more"):
+            break
+        cursor = blocks.get("next_cursor")
+    return {
+        "page_id": pg["id"],
+        "entries": entries,
+        "first_snapshot": (props.get("首次快照日", {}).get("date") or {}).get("start", ""),
+        "confidence": (props.get("可信度", {}).get("select") or {}).get("name", ""),
+        "last_update": "".join(
+            t.get("plain_text", "") for t in props.get("最後更新", {}).get("rich_text", [])
+        ),
+    }
+
+
+def create_revenue_month(month: str, first_snapshot: str) -> str:
+    """建立某月的頁面,回 page id。"""
+    data = _post(
+        "/pages",
+        {
+            "parent": {"type": "data_source_id", "data_source_id": REVENUE_DS},
+            "properties": {
+                "月份": {"title": [{"text": {"content": month}}]},
+                "首次快照日": {"date": {"start": first_snapshot}},
+                "已記錄家數": {"number": 0},
+                "可信度": {"select": {"name": "累積中"}},
+            },
+        },
+    )
+    return data.get("id", "")
+
+
+def append_revenue_entries(page_id: str, items: list[str]) -> int:
+    """把當日新發現的記錄(已是 '代碼:日' 字串)append 成新的段落塊。回 append 的塊數。"""
+    if not items:
+        return 0
+    chunks, buf = [], ""
+    for it in items:
+        piece = (buf + "," + it) if buf else it
+        if len(piece) > _REV_CHUNK:
+            chunks.append(buf)
+            buf = it
+        else:
+            buf = piece
+    if buf:
+        chunks.append(buf)
+    for i in range(0, len(chunks), 100):  # 單次 append 上限 100 塊
+        _patch(
+            f"/blocks/{page_id}/children",
+            {"children": [
+                {"object": "block", "type": "paragraph",
+                 "paragraph": {"rich_text": [{"type": "text", "text": {"content": c}}]}}
+                for c in chunks[i:i + 100]
+            ]},
+        )
+    return len(chunks)
+
+
+def update_revenue_month_props(page_id: str, count: int, confidence: str, note: str = "") -> None:
+    """更新該月統計欄位(家數/可信度/最後更新)。"""
+    props: dict = {
+        "已記錄家數": {"number": int(count)},
+        "最後更新": {"rich_text": [{"text": {"content": note[:1900]}}]},
+    }
+    if confidence:
+        props["可信度"] = {"select": {"name": confidence}}
+    _patch(f"/pages/{page_id}", {"properties": props})
+
+
+def list_revenue_months(limit: int = 24) -> list[dict]:
+    """列出所有月份頁(新→舊),回 [{'month','page_id','confidence','count'}]。供推估時取歷史。"""
+    data = _post(
+        f"/data_sources/{REVENUE_DS}/query",
+        {"sorts": [{"property": "月份", "direction": "descending"}], "page_size": min(limit, 100)},
+    )
+    out = []
+    for pg in data.get("results", []):
+        props = pg.get("properties", {})
+        month = "".join(
+            t.get("plain_text", "") for t in props.get("月份", {}).get("title", [])
+        ).strip()
+        out.append({
+            "month": month,
+            "page_id": pg["id"],
+            "confidence": (props.get("可信度", {}).get("select") or {}).get("name", ""),
+            "count": props.get("已記錄家數", {}).get("number") or 0,
+        })
+    return out
 
 
 def find_stock_page(code: str, name: str = "") -> dict | None:
