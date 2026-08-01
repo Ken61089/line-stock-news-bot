@@ -744,6 +744,11 @@ def maybe_start_scheduler() -> None:
         "每週 %s %02d:%02d 推下週%s(台灣時間)。",
         d_h, d_m, tomorrow_log, _WEEKDAY_ZH[w_dow], w_h, w_m, fetch_log,
     )
+    logger.info(
+        "維運告警收件人:%s",
+        "本人私訊" if os.environ.get("LINE_ALLOWED_USER_ID", "").strip()
+        else "群組(未設 LINE_ALLOWED_USER_ID,建議設定以免告警吵到群組)",
+    )
 
 
 def _parse_hhmm(s: str, dh: int, dm: int) -> tuple[int, int]:
@@ -767,9 +772,11 @@ JOB_ALERT_REPEAT = int(os.environ.get("JOB_ALERT_REPEAT", "12"))
 
 
 def _alert(text: str) -> None:
-    """告警推播;告警本身失敗只寫 log,絕不讓它拖垮排程。"""
+    """維運告警只推「本人私訊」,不進群組(群組不需要知道排程壞掉,也省額度:
+    推群組是按成員數計費,1:1 只算 1 則)。沒設 LINE_ALLOWED_USER_ID 才退回群組。
+    告警本身失敗只寫 log,絕不讓它拖垮排程。"""
     try:
-        push(text)
+        push(text, target_id=os.environ.get("LINE_ALLOWED_USER_ID", "").strip())
     except Exception:  # noqa: BLE001
         logger.exception("告警推播失敗(原訊息:%s)", text[:80])
 
@@ -780,7 +787,7 @@ def _safe(fn):
     def wrapper():
         try:
             fn()
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
             logger.exception("排程任務執行失敗:%s", name)
             n = _JOB_FAILS[name] = _JOB_FAILS.get(name, 0) + 1
             # 剛好到門檻時告警一次;之後每 JOB_ALERT_REPEAT 次再提醒,不每次都推
@@ -789,8 +796,10 @@ def _safe(fn):
                     "⚠️ 排程異常\n"
                     f"任務:{name}\n"
                     f"已連續失敗 {n} 次\n"
-                    "常見原因:Firecrawl 額度用盡 / 來源網站改版 / API key 失效\n"
-                    "查原因:Zeabur log。查額度:打「用量」"
+                    # 帶上實際錯誤,不用再翻 Zeabur log 才知道是什麼掛了
+                    f"最後錯誤:{type(e).__name__}: {str(e)[:150] or '(無訊息)'}\n"
+                    "常見原因:來源網站抖動/改版 / Firecrawl 額度用盡 / API key 失效\n"
+                    "詳情:Zeabur log。查額度:打「用量」"
                 )
         else:
             # 從失敗中恢復也要通知,否則不知道問題何時解決(或以為還壞著)

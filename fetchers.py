@@ -77,10 +77,29 @@ _EARNINGS_TYPE = "法說會"
 _HORIZON_DAYS = 120  # 只抓未來 120 天內的法說會
 
 
+def _fetch_html(url: str, *, headers: dict | None = None, follow_redirects: bool = False,
+                timeout: int = 30, tries: int = 3):
+    """抓網頁並自動重試。回 httpx.Response(呼叫端自行決定編碼)。
+    ⚠️台灣政府站(MOPS/TWSE/TDCC)會偶發 `ConnectError: [Errno 104] Connection reset by peer`,
+    沒有重試的話單次抖動就整個排程任務失敗(2026-08-01 踩過:MOPS 連兩輪失敗觸發告警)。"""
+    last: Exception | None = None
+    for i in range(tries):
+        if i:
+            time.sleep(1.5 * i)  # 1.5s、3s 退避
+        try:
+            r = httpx.get(url, headers=headers, timeout=timeout,
+                          follow_redirects=follow_redirects)
+            r.raise_for_status()
+            return r
+        except httpx.HTTPError as e:
+            last = e
+            logger.warning("抓取第 %d 次失敗(%s):%s", i + 1, url[:50], e)
+    raise last if last else RuntimeError(f"抓取失敗:{url}")
+
+
 def fetch_moneylink_rows() -> list[dict]:
     """抓 money-link 法說會表,回傳 [{date, code, name, time, place, message, link}]。"""
-    r = httpx.get(MONEY_LINK_URL, timeout=30)
-    r.raise_for_status()
+    r = _fetch_html(MONEY_LINK_URL)
     html = r.content.decode("big5", errors="ignore")
     rows = []
     for m in _ROW_RE.finditer(html):
@@ -99,8 +118,7 @@ def fetch_moneylink_rows() -> list[dict]:
 
 def fetch_tdcc_rows() -> list[dict]:
     """抓 TDCC IR 平台法說會列表(只取法說會類),回傳同 money-link 的欄位格式。"""
-    r = httpx.get(TDCC_URL, timeout=30, follow_redirects=True)
-    r.raise_for_status()
+    r = _fetch_html(TDCC_URL, follow_redirects=True)
     rows = []
     for m in _TDCC_RE.finditer(r.text):
         code, name, y, mo, d, tm, mtype, pdf = m.groups()
@@ -394,8 +412,7 @@ _mops_baselined = False
 
 def fetch_mops_announcements() -> list[dict]:
     """抓 MOPS 即時重大訊息(今天全部公司),回傳 [{code,name,date,time,subject,skey}]。"""
-    r = httpx.get(MOPS_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
-    r.raise_for_status()
+    r = _fetch_html(MOPS_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
     html = r.content.decode("utf-8", "ignore")
     out = []
     for code, name, date, tm, subj, skey in _MOPS_ROW_RE.findall(html):
