@@ -727,7 +727,7 @@ def maybe_start_scheduler() -> None:
         fetch_log += "、每 2 小時監看重大訊息"
         # 月營收公布日曆:每晚 21:10 抓兩市營收,記錄各檔「第一次出現該月資料」的日期。
         # 營收多在盤後送出、10 日當天傍晚湧入,故排在晚上;函式自身只在每月 1-20 日做事。
-        _scheduler.add_job(
+        sched.add_job(  # ⚠️此處是區域變數 sched,_scheduler 要到 sched.start() 之後才指派
             _safe(fetchers.sync_revenue_calendar),
             CronTrigger(hour=21, minute=10, timezone=tz),
             id="revenue_calendar", replace_existing=True,
