@@ -203,16 +203,59 @@ def _prev_quarter(year: int, quarter: int):
     return (year - 1, 4) if quarter == 1 else (year, quarter - 1)
 
 
+# 相鄰兩季隱含股數差超過這個比例,單季 EPS 就改用淨利回推(相減誤差已經不能忽略)
+_BASIS_DRIFT = 0.03
+# 但要「大聲警示不可直接比較」的門檻高得多 —— 兩種增資的性質完全不同:
+#   現金增資/CB 轉股(有對價):**不追溯調整**,各期累計值都是自己期間的實際加權,基準一致,
+#     只是相減會有誤差 → 用淨利回推修正即可,不必警示。
+#   配股/股票分割(無對價):IFRS 要求**追溯調整**所有比較期間,但 MOPS 彙總表不會回頭改我們
+#     庫裡已存的舊值 → 新舊基準混在同一張表,跨線比較會嚴重誤導,這才要警示。
+# 無對價配股/分割的幅度通常在 20% 以上,用這個門檻把兩者分開。
+_BASIS_BREAK_PCT = 0.20
+
+
+def basis_changed(cur: dict, prev: dict | None) -> bool:
+    """本季與前季的 EPS 是否已不同基準(配股/股票分割會追溯調整前期,我們庫裡的舊值卻沒跟著改)。
+    2026-08 實例:國巨 2025 年 1 股拆 4 股,Q3 起追溯成分割後基準,
+    Q2 累計 20.51(5.13 億股)vs Q3 累計 8.22(20.54 億股),硬相減會得到 -12.29 的假虧損。"""
+    if not prev:
+        return False
+    s_cur, s_prev = implied_shares(cur), implied_shares(prev)
+    if not s_cur or not s_prev:
+        return False
+    return abs(s_cur - s_prev) / s_prev > _BASIS_DRIFT
+
+
+def single_eps(cur: dict, prev: dict | None):
+    """算單季 EPS。回 (值, 是否為估算值)。
+    正常情況用累計相減(精確);基準變動時改用「單季淨利 ÷ 本季加權股數」——
+    淨利相減不受股數影響,除以本季自己的加權股數就回到同一基準
+    (國巨 2025Q3 驗證:63.56 億 ÷ 20.54 億股 = 3.09,與追溯調整後的 8.22−5.13 完全一致)。"""
+    if cur.get("quarter") == 1:
+        return cur.get("cum_eps"), False
+    if not prev:
+        return None, False
+    if not basis_changed(cur, prev):
+        if cur.get("cum_eps") is None or prev.get("cum_eps") is None:
+            return None, False
+        return round(cur["cum_eps"] - prev["cum_eps"], 4), False
+    shares = implied_shares(cur)
+    if shares and cur.get("cum_ni") is not None and prev.get("cum_ni") is not None:
+        return round((cur["cum_ni"] - prev["cum_ni"]) / shares, 4), True
+    return None, False
+
+
 def recompute_quarterly(code: str, rows: list[dict] | None = None) -> int:
     """重算某檔所有季的單季值(EPS/營收/淨利)並回寫有變動的列,回傳更新筆數。
-    Q1 單季=累計;Q2~Q4 單季=本季累計−前季累計(前季缺資料就留空)。"""
+    Q1 單季=累計;Q2~Q4 單季=本季累計−前季累計(前季缺資料就留空)。
+    ⚠️ EPS 另有基準變動的處理,見 single_eps;營收與淨利不受股數影響,一律直接相減。"""
     rows = rows if rows is not None else nt.list_eps(code=code)
     by_q = {(r["year"], r["quarter"]): r for r in rows if r["year"] and r["quarter"]}
     updated = 0
     for (y, q), r in by_q.items():
         prev = by_q.get(_prev_quarter(y, q)) if q > 1 else None
-        vals = {}
-        for key, cum_key in (("q_eps", "cum_eps"), ("q_rev", "cum_rev"), ("q_ni", "cum_ni")):
+        vals = {"q_eps": single_eps(r, prev)[0]}
+        for key, cum_key in (("q_rev", "cum_rev"), ("q_ni", "cum_ni")):
             cum = r.get(cum_key)
             if cum is None:
                 vals[key] = None
@@ -432,6 +475,32 @@ def implied_shares(row: dict):
     return abs(ni) / abs(eps)
 
 
+def basis_break_warnings(rows: list[dict]) -> tuple[list[str], set]:
+    """找出 EPS 基準改變的**斷點**(配股/股票分割),提醒斷點前後的數字不可直接比較。
+    回 (警示列表, 涉及年份集合)。
+
+    ⚠️ 這比「年度內股數變動」嚴重得多:斷點前後連**跨年比較**都會誤導 ——
+    國巨 2024 全年 38.13(分割前)vs 2025 全年 11.51(分割後),看起來像 EPS 崩掉六成,
+    實際上 38.13÷4=9.53,2025 是成長的。所以警示要直接給換算倍數。"""
+    seq = sorted([r for r in rows if r.get("year") and r.get("quarter")],
+                 key=lambda r: (r["year"], r["quarter"]))
+    out, years = [], set()
+    for i in range(1, len(seq)):
+        cur, prev = seq[i], seq[i - 1]
+        s_cur, s_prev = implied_shares(cur), implied_shares(prev)
+        if not s_cur or not s_prev:
+            continue
+        ratio = s_cur / s_prev
+        if abs(ratio - 1) < _BASIS_BREAK_PCT:  # 漸進增資不算基準斷點,不必警示
+            continue
+        out.append(f"⚠️ {cur['year']}Q{cur['quarter']} 起股數基準已變"
+                   f"({s_prev:.2f}→{s_cur:.2f} 億股),更早的累計 EPS ÷{ratio:.1f} 才同基準;"
+                   f"跨這條線的數字不可直接比較")
+        years.add(cur["year"])
+        years.add(prev["year"])
+    return out[-2:], years  # 只留最近兩個斷點,免得訊息太長
+
+
 def share_change_warnings(rows: list[dict], years: set | None = None) -> list[str]:
     """挑出「年度內加權股數明顯變動」的年份 —— 那幾年的單季 EPS(累計相減)不能拿來估值。
     ⚠️ 只有年度**內**的變動才影響相減:Q1 單季=累計不必相減,失真只發生在 Q2~Q4。"""
@@ -478,10 +547,14 @@ def format_eps_table(code: str, name: str = "", limit: int = 6) -> str:
         label = "全年" if top["quarter"] == 4 else f"至Q{top['quarter']}"
         return f"　└ {year} {label} {top['cum_eps']:.2f}"
 
+    by_q = {(r["year"], r["quarter"]): r for r in all_rows if r["year"] and r["quarter"]}
     for i, r in enumerate(rows):
         y, q = r["year"], r["quarter"]
         cum = f"{r['cum_eps']:.2f}" if r["cum_eps"] is not None else "－"
         single = f"{r['q_eps']:.2f}" if r["q_eps"] is not None else "－"
+        # Q1 的單季直接等於累計、不做相減,所以不會有估算問題,不標記
+        if q > 1 and r["q_eps"] is not None and basis_changed(r, by_q.get(_prev_quarter(y, q))):
+            single += "~"  # 該季股數有變,單季值是用淨利回推的估算
         mark = "" if r["source"] == "重訊詳細頁" else "*"
         lines.append(f"{y}Q{q}｜{single}｜{cum}{mark}")
         is_last_of_year = i + 1 == len(rows) or rows[i + 1]["year"] != y
@@ -490,8 +563,15 @@ def format_eps_table(code: str, name: str = "", limit: int = 6) -> str:
             if total:
                 lines.append(total)
     # 增資警示用**全部**季判斷(不只表上顯示的 6 季),否則跨年的股數變化會看不出來
-    lines += share_change_warnings(all_rows, years={r["year"] for r in rows})
-    lines.append("＊=彙總表回補;單季由累計相減")
+    # 基準斷點(配股/分割)最優先講;該年已被斷點涵蓋就不再重複出年度股數警示
+    breaks, break_years = basis_break_warnings(all_rows)
+    lines += breaks
+    lines += share_change_warnings(all_rows,
+                                   years={r["year"] for r in rows} - break_years)
+    legend = "＊=彙總表回補;單季由累計相減"
+    if any("~" in ln for ln in lines):
+        legend += "\n~=該季股數有變,單季改用淨利÷加權股數回推"
+    lines.append(legend)
     return "\n".join(lines)
 
 
