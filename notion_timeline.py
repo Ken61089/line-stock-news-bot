@@ -430,9 +430,32 @@ def list_revenue_months(limit: int = 24) -> list[dict]:
     return out
 
 
+# ---- CB → 現股還原(可轉債名稱=現股名+序號、代號=現股代號+序號)----
+_CB_SUFFIX = "一二三四五六七八九十1234567890"
+
+
+def _cb_to_common_code(code: str) -> str:
+    """23031 → 2303。CB 代號=現股 4 碼+1 位序號,固定 5 碼且不以 00 開頭;
+    排除 ETF(00 開頭,如 006208 會被誤還原成不存在的 0062)。"""
+    code = (code or "").strip()
+    if len(code) == 5 and code.isdigit() and not code.startswith("00"):
+        return code[:4]
+    return ""
+
+
+def _cb_to_common_name(name: str) -> str:
+    """聯電一 → 聯電;只砍結尾一個序號字,且砍完至少要留 2 字(避免「台一」被砍成「台」)。"""
+    name = (name or "").strip()
+    if len(name) >= 3 and name[-1] in _CB_SUFFIX:
+        return name[:-1]
+    return ""
+
+
 def find_stock_page(code: str, name: str = "") -> dict | None:
     """在個股主表用代號(優先)或名稱找個股頁。
-    回傳 {'id', 'label', 'concept_ids'} 或 None;concept_ids 為該股「🔗 隸屬概念」的概念頁 ids。"""
+    回傳 {'id', 'label', 'concept_ids'} 或 None;concept_ids 為該股「🔗 隸屬概念」的概念頁 ids。
+    找不到時會把 CB 還原成現股再試一次(CB 命名=現股名+序號、代號=現股代號+序號),
+    這樣「聯電一」「23031」的 CB 事件才連得到主表裡的「2303 聯電」。"""
     queries = []
     code = (code or "").strip()
     name = (name or "").strip()
@@ -441,6 +464,10 @@ def find_stock_page(code: str, name: str = "") -> dict | None:
         queries.append(m.group(0))
     if name:
         queries.append(name)
+    # 後備:CB → 現股(放最後,先讓精確比對有機會命中)
+    for base in (_cb_to_common_code(m.group(0) if m else ""), _cb_to_common_name(name)):
+        if base and base not in queries:
+            queries.append(base)
     for q in queries:
         data = _post(
             f"/data_sources/{STOCK_DS}/query",
