@@ -368,7 +368,14 @@ def backfill(quarters: int = 8, codes: list[str] | None = None,
     if not idx:
         return {"quarters": 0, "filled": 0, "skipped": 0, "stocks": 0}
 
-    qs = qs if qs is not None else recent_quarters(quarters)
+    if qs is None:
+        qs = recent_quarters(quarters)
+        # recent_quarters 以「申報期限已過」為準,所以財報季**進行中**的那一季不會列入
+        # (例如 8/4 時 2026Q2 期限 8/19 還沒到)。但公司從 8/1 就陸續申報、彙總表當天就查得到,
+        # 手動打「EPS 回補」的人要的正是最新那季 —— 在窗口內就補進來。
+        target = _window_target(datetime.date.today())
+        if target and target not in qs:
+            qs = [target] + qs[:-1]
     existing = {}
     for code in idx:
         for r in nt.list_eps(code=code):
