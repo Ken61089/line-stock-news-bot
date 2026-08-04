@@ -388,16 +388,28 @@ def format_eps_table(code: str, name: str = "", limit: int = 6) -> str:
         return f"{code} 目前沒有 EPS 資料。財報公布後會自動抓,或打「EPS 回補」補歷史。"
     title = f"{code} {name or rows[0].get('name', '')}".strip()
     lines = [f"📊 {title} 每股盈餘", "季別｜單季｜累計"]
-    for r in rows:
+    # rows 已由新到舊排序,同一年份的季會連在一起 → 每個年份區塊結束時補一行小計。
+    # 小計直接取該年「最大季的累計 EPS」(季報的累計本來就是年初至今),不用自己加總,
+    # 這樣即使該年只顯示到 Q4 一列,小計仍是正確的全年值。
+    def year_total(year: int) -> str:
+        same = [r for r in rows if r["year"] == year and r["cum_eps"] is not None]
+        if not same:
+            return ""
+        top = max(same, key=lambda r: r["quarter"] or 0)
+        label = "全年" if top["quarter"] == 4 else f"至Q{top['quarter']}"
+        return f"　└ {year} {label} {top['cum_eps']:.2f}"
+
+    for i, r in enumerate(rows):
         y, q = r["year"], r["quarter"]
         cum = f"{r['cum_eps']:.2f}" if r["cum_eps"] is not None else "－"
         single = f"{r['q_eps']:.2f}" if r["q_eps"] is not None else "－"
         mark = "" if r["source"] == "重訊詳細頁" else "*"
         lines.append(f"{y}Q{q}｜{single}｜{cum}{mark}")
-    # 近四季 EPS 合計(需要連續四季單季值)
-    singles = [r["q_eps"] for r in rows[:4] if r["q_eps"] is not None]
-    if len(singles) == 4:
-        lines.append(f"近四季合計:{sum(singles):.2f}")
+        is_last_of_year = i + 1 == len(rows) or rows[i + 1]["year"] != y
+        if is_last_of_year:
+            total = year_total(y)
+            if total:
+                lines.append(total)
     lines.append("＊=彙總表回補(僅 EPS);單季由累計相減,增資年份會失真")
     return "\n".join(lines)
 
