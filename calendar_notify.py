@@ -733,6 +733,15 @@ def maybe_start_scheduler() -> None:
             id="revenue_calendar", replace_existing=True,
         )
         fetch_log += "、每晚 21:10 記錄營收公布日"
+        # 財報 EPS 兜底補漏:每晚 22:40 跑,但函式自身只在財報公布窗口內動作。
+        # 主線是 MOPS 重訊即時抓(check_mops_alerts 內);這裡負責補「沒發重訊只申報財報」的公司。
+        import eps_tracker
+        sched.add_job(
+            _safe(eps_tracker.daily_backfill_job),
+            CronTrigger(hour=22, minute=40, timezone=tz),
+            id="eps_backfill", replace_existing=True,
+        )
+        fetch_log += "、每晚 22:40 補財報 EPS"
     except Exception:  # noqa: BLE001
         logger.exception("fetchers 掛載失敗,法說會自動抓取不啟用")
         fetch_log = ""

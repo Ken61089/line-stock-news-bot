@@ -401,11 +401,14 @@ def sync_econ_events(dry_run: bool = False) -> dict:
 # ==========================================================
 MOPS_URL = "https://mopsov.twse.com.tw/mops/web/t05sr01_1"
 _MOPS_ROW_RE = re.compile(
-    r"<td[^>]*>(\d{3,6})</td>\s*<td[^>]*>([^<]+)</td>\s*"
+    r"<td[^>]*>(\d{3,6})</td>\s*<td[^>]*>([^<]*)</td>\s*"
     r"<td[^>]*>(\d{3}/\d{2}/\d{2})</td>\s*<td[^>]*>([\d:]+)</td>\s*"
-    r"<td[^>]*>([^<]*)</td>\s*<td>\s*<input[^>]*?skey\.value='([^']+)'",
+    r"<td[^>]*>([^<]*)</td>\s*<td>\s*<input([^>]*)>",
     re.S,
 )
+# 「詳細資料」按鈕的 onclick 把 skey/COMPANY_ID/SPOKE_DATE/SPOKE_TIME/SEQ_NO 塞進表單再送出;
+# 用 key.value='v' 逐項解析(不依賴欄位順序),之後才有辦法 POST 詳細頁看內文。
+_MOPS_PARAM_RE = re.compile(r"(\w+)\.value='([^']*)'")
 _mops_seen: set = set()
 _mops_baselined = False
 
@@ -415,14 +418,23 @@ def fetch_mops_announcements() -> list[dict]:
     r = _fetch_html(MOPS_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=25)
     html = r.content.decode("utf-8", "ignore")
     out = []
-    for code, name, date, tm, subj, skey in _MOPS_ROW_RE.findall(html):
+    for code, name, date, tm, subj, btn in _MOPS_ROW_RE.findall(html):
+        p = dict(_MOPS_PARAM_RE.findall(btn))
+        skey = p.get("skey", "").strip()
+        if not skey:
+            continue
         out.append({
             "code": code.strip(),
             "name": re.sub(r"\s+", "", name).strip(),
             "date": date.strip(),
             "time": tm.strip(),
             "subject": re.sub(r"\s+", " ", subj).strip(),
-            "skey": skey.strip(),
+            "skey": skey,
+            # 開詳細頁用的參數(COMPANY_ID 可能帶前綴,如興櫃 C7932,不等於股票代號)
+            "company_id": p.get("COMPANY_ID", "").strip(),
+            "spoke_date": p.get("SPOKE_DATE", "").strip(),
+            "spoke_time": p.get("SPOKE_TIME", "").strip(),
+            "seq_no": p.get("SEQ_NO", "").strip(),
         })
     return out
 
@@ -498,6 +510,19 @@ def check_mops_alerts() -> dict:
                 )
             except nt.NotionError as e:
                 logger.warning("寫入重大訊息失敗(%s):%s", r["code"], e)
+
+        # 命中的重訊裡若有「董事會通過某季財務報告」,點進詳細頁抽累計 EPS 寫進 EPS 庫
+        try:
+            import eps_tracker
+            idx = {c: {"id": s["id"], "label": s["label"],
+                       "name": s["label"].replace(c, "", 1).strip()}
+                   for c, s in by_code.items()}
+            eps_res = eps_tracker.handle_financial_announcements(hits, stock_idx=idx)
+            if eps_res["saved"]:
+                logger.info("EPS 自動抓取:%d 檔 %s", eps_res["saved"], eps_res["codes"])
+        except Exception as e:  # noqa: BLE001 EPS 是加值功能,壞掉不能拖垮重訊掃描
+            logger.warning("EPS 自動抓取失敗:%s", e)
+
     logger.info("MOPS 重訊:新 %d 則,命中追蹤股 %d 則", len(fresh), len(hits))
     return {"total": len(rows), "new": len(fresh), "hits": len(hits)}
 

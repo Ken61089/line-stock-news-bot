@@ -28,6 +28,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from news_processor import route_and_store, NoCategoryError, is_group_additive_command
 import calendar_notify
 import fetchers
+import eps_tracker
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -120,6 +121,27 @@ def _reply_margin(reply_token: str, user_id: str, text: str) -> None:
     except Exception as e:  # noqa: BLE001
         logger.exception("融資查詢失敗")
         reply = f"❌ 融資查詢失敗:{e}"
+    if reply:
+        _say(reply_token, user_id, reply)
+
+
+# ---- 背景執行「EPS」查詢(財報每股盈餘表)並回覆 ----
+def _reply_eps(reply_token: str, user_id: str, text: str) -> None:
+    # 「EPS 回補」要跑好幾分鐘(16 次彙總請求 + 數百次 Notion 寫入),遠超過 reply token 時效,
+    # 所以先立刻回一則「開始回補」,跑完不推播(省 LINE 額度),使用者稍後自己查表。
+    if eps_tracker.is_backfill_command(text):
+        _say(reply_token, user_id, "⏳ 開始回補追蹤股近 8 季 EPS,約 5 分鐘。\n完成後打「EPS 代號」看表格(不另外推播)。")
+        try:
+            res = eps_tracker.backfill(quarters=8)
+            logger.info("EPS 回補完成:%s", res)
+        except Exception:  # noqa: BLE001
+            logger.exception("EPS 回補失敗")
+        return
+    try:
+        reply = eps_tracker.run_eps_query(text)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("EPS 查詢失敗")
+        reply = f"❌ EPS 查詢失敗:{e}"
     if reply:
         _say(reply_token, user_id, reply)
 
@@ -255,6 +277,15 @@ def callback():
         if fetchers.is_margin_command(text):
             threading.Thread(
                 target=_reply_margin,
+                args=(reply_token, user_id, text),
+                daemon=True,
+            ).start()
+            continue
+
+        # 「EPS 2330」查該檔各季單季/累計每股盈餘(「EPS 回補」補歷史):群組與私訊都可用
+        if eps_tracker.is_eps_command(text):
+            threading.Thread(
+                target=_reply_eps,
                 args=(reply_token, user_id, text),
                 daemon=True,
             ).start()
