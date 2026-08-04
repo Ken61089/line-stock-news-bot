@@ -381,7 +381,7 @@ def daily_backfill_job() -> dict:
 
 # ---------------------------------------------------------------- 呈現
 
-def format_eps_table(code: str, name: str = "", limit: int = 8) -> str:
+def format_eps_table(code: str, name: str = "", limit: int = 6) -> str:
     """把某檔的 EPS 表格排成 LINE 訊息(新到舊)。"""
     rows = nt.list_eps(code=code, limit=limit)
     if not rows:
@@ -406,7 +406,7 @@ def format_eps_table(code: str, name: str = "", limit: int = 8) -> str:
 
 _EPS_USAGE = (
     "📊 EPS 用法\n"
-    "EPS 2330 → 該檔近 8 季單季/累計每股盈餘\n"
+    "EPS 2330 → 該檔近 6 季單季/累計每股盈餘\n"
     "EPS 台積電 → 也可用主表裡的名稱\n"
     "EPS 回補 → 用 MOPS 彙總表補齊追蹤股近 8 季(要跑 1~2 分鐘)\n"
     "\n"
