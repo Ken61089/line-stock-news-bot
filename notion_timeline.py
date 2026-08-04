@@ -13,9 +13,13 @@ Notion 端的 rollup(💡 自動辨別:相關族群)會自動帶出概念族群,
 
 import os
 import re
+import time
+import logging
 import datetime
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "").strip()
 NOTION_VERSION = os.environ.get("NOTION_VERSION", "2025-09-03")
@@ -61,25 +65,52 @@ def _headers() -> dict:
     }
 
 
+def _request(method: str, path: str, payload: dict | None = None, tries: int = 3) -> dict:
+    """呼叫 Notion API,對「暫時性失敗」自動重試。
+
+    ⚠️ 2026-08-04 踩過:批次回補 EPS 時單次 `ReadTimeout` 就讓整個任務中斷 ——
+    幾百次寫入跑到一半全白工。逾時、5xx、429 都是等一下就會好的,重試;
+    4xx(欄位錯、權限錯)重試幾次都一樣,直接拋。"""
+    last: Exception | None = None
+    for i in range(tries):
+        if i:
+            time.sleep(1.5 * i)  # 1.5s、3s 退避
+        try:
+            r = httpx.request(method, f"{_API}{path}", headers=_headers(),
+                              json=payload, timeout=30)
+        except httpx.HTTPError as e:
+            last = e
+            logger.warning("Notion %s %s 第 %d 次連線失敗:%s", method, path[:40], i + 1, e)
+            continue
+        if r.status_code == 429:  # 限流,照 Retry-After 等
+            wait = 2.0
+            try:
+                wait = float(r.headers.get("Retry-After", 2))
+            except ValueError:
+                pass
+            logger.warning("Notion 限流,等 %.1fs 重試", wait)
+            time.sleep(wait)
+            last = NotionError("Notion API 429: rate limited")
+            continue
+        if r.status_code >= 500:
+            last = NotionError(f"Notion API {r.status_code}: {r.text[:200]}")
+            continue
+        if r.status_code >= 300:
+            raise NotionError(f"Notion API {r.status_code}: {r.text[:300]}")
+        return r.json()
+    raise last if isinstance(last, NotionError) else NotionError(f"Notion API 連線失敗:{last}")
+
+
 def _post(path: str, payload: dict) -> dict:
-    r = httpx.post(f"{_API}{path}", headers=_headers(), json=payload, timeout=20)
-    if r.status_code >= 300:
-        raise NotionError(f"Notion API {r.status_code}: {r.text[:300]}")
-    return r.json()
+    return _request("POST", path, payload)
 
 
 def _patch(path: str, payload: dict) -> dict:
-    r = httpx.patch(f"{_API}{path}", headers=_headers(), json=payload, timeout=20)
-    if r.status_code >= 300:
-        raise NotionError(f"Notion API {r.status_code}: {r.text[:300]}")
-    return r.json()
+    return _request("PATCH", path, payload)
 
 
 def _get(path: str) -> dict:
-    r = httpx.get(f"{_API}{path}", headers=_headers(), timeout=20)
-    if r.status_code >= 300:
-        raise NotionError(f"Notion API {r.status_code}: {r.text[:300]}")
-    return r.json()
+    return _request("GET", path)
 
 
 def _dedup(items) -> list:

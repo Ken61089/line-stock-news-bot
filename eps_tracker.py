@@ -448,6 +448,24 @@ def sync_latest_quarter() -> dict:
     return res
 
 
+def sync_new_stocks(quarters: int = 8) -> dict:
+    """把「主表有、EPS 庫卻完全沒資料」的個股補上近 N 季。
+
+    重訊主線每輪都重讀主表,所以新加進追蹤的股票**之後**公布的財報會自動進來,
+    但它不會自己長出歷史 —— 這個排程負責補那段。
+    ⚠️ 排程刻意設成每週一次而非每天:興櫃/CB/外國股永遠不會出現在彙總表,
+    每天跑等於每天白花 16 次彙總請求(一次 1.6MB)重試同一批查不到的代號。"""
+    idx = _stock_index()
+    known = {r["code"] for r in nt.list_eps(limit=2000) if r["code"]}
+    fresh = sorted(c for c in idx if c not in known)
+    if not fresh:
+        return {"new": 0}
+    logger.info("EPS:發現 %d 檔沒有歷史的追蹤股,回補近 %d 季:%s", len(fresh), quarters, fresh)
+    res = backfill(quarters=quarters, codes=fresh)
+    res["new"] = len(fresh)
+    return res
+
+
 def daily_backfill_job() -> dict:
     """每日排程進入點:只在財報公布窗口內跑一次兜底補漏(補沒發重訊、只默默申報的公司)。"""
     target = _window_target(datetime.date.today())

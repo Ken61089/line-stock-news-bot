@@ -742,6 +742,14 @@ def maybe_start_scheduler() -> None:
             id="eps_backfill", replace_existing=True,
         )
         fetch_log += "、每晚 22:40 補財報 EPS"
+        # 新加進追蹤的個股不會自己長出歷史 EPS,每週日 22:50 補一次近 8 季。
+        # 設每週而非每天:興櫃/CB/外國股永遠查不到,每天跑等於天天白抓 16 次彙總表。
+        sched.add_job(
+            _safe(eps_tracker.sync_new_stocks),
+            CronTrigger(day_of_week=6, hour=22, minute=50, timezone=tz),
+            id="eps_new_stocks", replace_existing=True,
+        )
+        fetch_log += "、每週日 22:50 補新追蹤股 EPS 歷史"
     except Exception:  # noqa: BLE001
         logger.exception("fetchers 掛載失敗,法說會自動抓取不啟用")
         fetch_log = ""
