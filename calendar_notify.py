@@ -852,3 +852,22 @@ if __name__ == "__main__":
         print(out or "(無事件,不會推播)")
     else:
         print("已執行" + mode + (",無事件未推播" if out is None else ",已推播"))
+
+
+def scheduler_jobs() -> list[dict]:
+    """回報**實際掛上**的排程(id / trigger / 下次執行時間),給健康檢查端點用。
+
+    ⚠️ 不要從 env 預設值反推排程 —— 本機 `.env` 與 Zeabur 後台常常不同步
+    (2026-08-04 確認:本機 .env 根本沒有 NOTIFY_DAILY_TIME,線上卻設了 08:30),
+    只有問 scheduler 本人才知道線上真正在跑什麼。"""
+    if _scheduler is None:
+        return []
+    out = []
+    for j in _scheduler.get_jobs():
+        nxt = getattr(j, "next_run_time", None)
+        out.append({
+            "id": j.id,
+            "trigger": str(j.trigger),
+            "next": nxt.strftime("%Y-%m-%d %H:%M %Z") if nxt else "",
+        })
+    return out

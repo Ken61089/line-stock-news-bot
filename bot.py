@@ -189,12 +189,32 @@ def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-08-01-cb-link"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-08-04-eps"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
 def health():
     return f"OK, news bot is running. [{APP_VERSION}]", 200
+
+
+@app.get("/schedule")
+def schedule_info():
+    """回報線上**實際生效**的排程與開關,不含任何金鑰。
+    用途:確認 Zeabur 後台的環境變數到底設了什麼,不必進後台翻。
+
+    ⚠️ jobs 讀的是 APScheduler 裡真正掛上的 job,不是從 env 預設值反推 ——
+    本機 .env 與 Zeabur 後台常常不同步(本機根本沒有 NOTIFY_DAILY_TIME,
+    線上卻設了值),猜預設值會給出錯的答案。"""
+    e = os.environ.get
+    return {
+        "version": APP_VERSION,
+        "jobs": calendar_notify.scheduler_jobs(),
+        "主動推播總開關": "開" if calendar_notify.is_push_enabled() else "關",
+        "重訊命中即時推播": "開" if e("MOPS_ALERT_PUSH", "0").strip() != "0" else "關(只記 Notion)",
+        "明日彙整": "開" if e("ENABLE_TOMORROW_NOTIFY", "0").strip() != "0" else "關",
+        "本人白名單": "已設" if e("LINE_ALLOWED_USER_ID", "").strip() else "未設(破壞性指令與 EPS 回補的限制會失效)",
+        "推播目標": "已設" if e("LINE_NOTIFY_TARGET_ID", "").strip() else "未設",
+    }, 200
 
 
 # ---- LINE Webhook 入口 ----
@@ -282,8 +302,13 @@ def callback():
             ).start()
             continue
 
-        # 「EPS 2330」查該檔各季單季/累計每股盈餘(「EPS 回補」補歷史):群組與私訊都可用
+        # 「EPS 2330」查該檔各季單季/累計每股盈餘:唯讀,群組與私訊都可用。
+        # 但「EPS 回補」會打幾百次 Notion API + 抓 16 次 1.6MB 彙總表、跑 5 分鐘以上,
+        # 被群組成員誤觸代價不小 → 僅限本人。
         if eps_tracker.is_eps_command(text):
+            if eps_tracker.is_backfill_command(text) and ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
+                _say(reply_token, user_id, "「EPS 回補」僅限本人使用。查詢請打「EPS 代號」。")
+                continue
             threading.Thread(
                 target=_reply_eps,
                 args=(reply_token, user_id, text),
