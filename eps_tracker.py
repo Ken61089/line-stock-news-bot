@@ -606,7 +606,9 @@ _EPS_USAGE = (
     "📊 EPS 用法\n"
     "EPS 2330 → 該檔近 6 季單季/累計每股盈餘\n"
     "EPS 台積電 → 也可用主表裡的名稱\n"
-    "EPS 回補 → 用 MOPS 彙總表補齊追蹤股近 8 季(僅限本人,要跑 5 分鐘)\n"
+    "EPS 回補 2330 → 只補這一檔的歷史(約 3 分鐘,新加的股急用時打這個)\n"
+    "EPS 回補 → 補全部追蹤股(約 5~8 分鐘)\n"
+    "(回補僅限本人;跑完不推播,自己打「EPS 代號」看)\n"
     "\n"
     "平常不用管:追蹤股一發「董事會通過財務報告」重訊,2 小時內自動抓進表;\n"
     "沒發重訊的公司由每晚兜底補漏(只在財報公布月動作)。"
@@ -618,8 +620,39 @@ def is_eps_command(text: str) -> bool:
     return t.upper() == "EPS" or t.upper().startswith("EPS ") or t.upper().startswith("EPS　")
 
 
+def _eps_arg(text: str) -> str:
+    return (text or "").strip()[3:].replace("　", " ").strip()
+
+
 def is_backfill_command(text: str) -> bool:
-    return (text or "").strip()[3:].replace("　", " ").strip() in ("回補", "補", "回補歷史")
+    arg = _eps_arg(text)
+    return bool(arg) and arg.split()[0] in ("回補", "補", "回補歷史")
+
+
+def resolve_code(arg: str) -> tuple[str, str]:
+    """把「2330」或「台積電」對到主表裡的 (代號, 名稱);對不到回 ('', '')。"""
+    arg = (arg or "").strip()
+    if not arg:
+        return "", ""
+    want_code = arg if re.fullmatch(r"\d{3,6}", arg) else ""
+    for s in nt.list_stocks():
+        if not s["code"]:
+            continue
+        label_name = s["label"].replace(s["code"], "", 1).strip()
+        if (want_code and s["code"] == want_code) or (not want_code and arg == label_name):
+            return s["code"], label_name
+    return "", ""
+
+
+def backfill_target(text: str) -> list[str] | None:
+    """「EPS 回補 2330」/「EPS 回補 台積電」→ ['2330'];「EPS 回補」→ None(全部追蹤股)。
+    ⚠️ 指定了卻查不到(打錯代號)要回**空 list**,不能回 None —— 否則「EPS 回補 9999」
+    這種手誤會直接退化成全量回補,跑 8 分鐘、打幾百次 API。"""
+    parts = _eps_arg(text).split()
+    if len(parts) < 2:
+        return None
+    code, _ = resolve_code(parts[1])
+    return [code] if code else []
 
 
 def run_eps_query(text: str) -> str:
@@ -630,22 +663,18 @@ def run_eps_query(text: str) -> str:
         return ""
     if arg in ("用法", "說明", "help", "?"):
         return _EPS_USAGE
-    if arg in ("回補", "補", "回補歷史"):
-        res = backfill(quarters=8)
+    if is_backfill_command(text):
+        # 正常走 LINE 進來的回補由 bot 端接手(先回覆再背景跑,避開 reply token 時效);
+        # 這裡是給直接呼叫用的同步版本。
+        codes = backfill_target(text)
+        if codes == []:
+            return "找不到這一檔,請確認代號或名稱在個股主表裡。"
+        res = backfill(quarters=8, codes=codes)
         return (f"✅ EPS 回補完成:{res['stocks']} 檔 × 近 {res['quarters']} 季\n"
                 f"新填 {res['filled']} 格、既有跳過 {res['skipped']} 格\n"
                 f"打「EPS 代號」看表格。")
 
-    code, name = "", ""
-    if re.fullmatch(r"\d{3,6}", arg):
-        code = arg
-    for s in nt.list_stocks():
-        if not s["code"]:
-            continue
-        label_name = s["label"].replace(s["code"], "", 1).strip()
-        if (code and s["code"] == code) or (not code and arg == label_name):
-            code, name = s["code"], label_name
-            break
+    code, name = resolve_code(arg)
     if not code:
         return ""
     return format_eps_table(code, name)

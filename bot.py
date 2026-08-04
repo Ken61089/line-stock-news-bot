@@ -130,10 +130,17 @@ def _reply_eps(reply_token: str, user_id: str, text: str) -> None:
     # 「EPS 回補」要跑好幾分鐘(16 次彙總請求 + 數百次 Notion 寫入),遠超過 reply token 時效,
     # 所以先立刻回一則「開始回補」,跑完不推播(省 LINE 額度),使用者稍後自己查表。
     if eps_tracker.is_backfill_command(text):
-        _say(reply_token, user_id, "⏳ 開始回補追蹤股近 8 季 EPS,約 5 分鐘。\n完成後打「EPS 代號」看表格(不另外推播)。")
+        codes = eps_tracker.backfill_target(text)
+        if codes == []:  # 有指定但查無此檔(打錯代號)→ 不能當成「補全部」
+            _say(reply_token, user_id, "找不到這一檔,請確認代號或名稱在個股主表裡。\n要補全部就只打「EPS 回補」。")
+            return
+        who = f"{codes[0]} 這一檔" if codes else "全部追蹤股"
+        mins = "約 3 分鐘" if codes else "約 5~8 分鐘"
+        _say(reply_token, user_id,
+             f"⏳ 開始回補{who}近 8 季 EPS,{mins}。\n完成後打「EPS 代號」看表格(不另外推播)。")
         try:
-            res = eps_tracker.backfill(quarters=8)
-            logger.info("EPS 回補完成:%s", res)
+            res = eps_tracker.backfill(quarters=8, codes=codes)
+            logger.info("EPS 回補完成(%s):%s", who, res)
         except Exception:  # noqa: BLE001
             logger.exception("EPS 回補失敗")
         return
@@ -189,7 +196,7 @@ def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-08-04-eps"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-08-04-eps2"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
