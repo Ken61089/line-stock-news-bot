@@ -757,6 +757,9 @@ _HELP_TEXT = (
     "• 改股 1514:1815 富喬 → 所有分頁一次改\n"
     "• 主表 改股 1514:1815 富喬 → 只改主表\n"
     "\n"
+    "━━ 新增追蹤標的 ━━\n"
+    "• 主表 加股 3529 力旺(只建檔,不掛概念不建事件)\n"
+    "\n"
     "━━ 改錯:概念股主表 ━━\n"
     "• 主表 加 CPO:6442 光聖\n"
     "• 主表 移除 光通訊:2330\n"
@@ -1799,6 +1802,7 @@ def _answer_query(question: str) -> Result:
 # ==========================================================
 _MASTER_HELP = (
     "🛠️ 概念股主表指令:\n"
+    "• 主表 加股 <代號 名稱>       例:主表 加股 3529 力旺(只建檔,不掛概念)\n"
     "• 主表 加 <概念>:<個股>       例:主表 加 CPO:6442 光聖\n"
     "• 主表 移除 <概念>:<個股>     例:主表 移除 光通訊:2330\n"
     "• 主表 移除股 <個股>          例:主表 移除股 8111(從所有概念移除)\n"
@@ -1921,6 +1925,33 @@ def _master_command(text: str) -> Result:
             if created:
                 msg += f"\n🆕 順便新增個股:{', '.join(created)}"
             return Result("主表", msg)
+
+        if action in ("加股", "新增股", "加個股"):
+            # 只建檔:不掛概念、不建事件。用於「先納入追蹤,概念之後再說」。
+            # 進了主表就自動接上每 2 小時的重訊掃描與 EPS 抓取(兩者都是每輪重讀主表)。
+            stocks = _split_list(rest)
+            if not stocks:
+                return Result("主表", "用法:主表 加股 <代號 名稱>\n"
+                                      "例:主表 加股 3529 力旺\n"
+                                      "(多檔用逗號分隔;只建檔不掛概念,概念用「主表 加 概念:個股」)")
+            created, existed = [], []
+            for s in stocks:
+                sp = nt.find_stock_page("", s)
+                if sp:
+                    existed.append(sp["label"])
+                else:
+                    created.append(nt.create_stock_page("", s)["label"])
+            lines = []
+            if created:
+                lines.append(f"✅ 已新增到個股主表:{', '.join(created)}")
+                lines.append("• 下一輪重訊掃描(每 2 小時)起自動涵蓋")
+                first = re.search(r"\d{3,6}", created[0])
+                lines.append(f"• EPS 歷史:打「EPS 回補 {first.group(0) if first else '代號'}」立刻補,"
+                             "或等週日 22:50 自動補")
+            if existed:
+                lines.append(f"ℹ️ 本來就在主表:{', '.join(existed)}")
+            lines.append("⚠️ 確認一下代號有沒有打錯(代號錯了資料會抓成別家公司)")
+            return Result("主表", "\n".join(lines))
 
         if action in ("移除", "刪股", "移除個股"):
             concept, stock = _split_colon(rest)
