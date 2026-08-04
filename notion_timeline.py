@@ -28,6 +28,8 @@ KNOWLEDGE_DS = os.environ.get("NOTION_KNOWLEDGE_DS", "517dd7f8-6804-4048-bd0c-52
 AI_USAGE_DS = os.environ.get("NOTION_AI_USAGE_DS", "71bdc5e1-59f0-424b-acec-4ad47076861c").strip()
 # 營收公布日曆(一月一頁,頁面內文分塊存「代碼:公布日」;2026-07-30 建於股票大腦母頁下)
 REVENUE_DS = os.environ.get("NOTION_REVENUE_DS", "1eb50a13-e713-4d18-a9ae-27b7a84a8941").strip()
+# 財報 EPS 庫(一檔一季一列,累計值來自 MOPS,單季由相鄰兩季相減;2026-08-04 建於股票大腦母頁下)
+EPS_DS = os.environ.get("NOTION_EPS_DS", "273aa9fb-74ab-4a47-aa7e-9cb1b076c7d5").strip()
 
 _API = "https://api.notion.com/v1"
 _STOCK_CODE_RE = re.compile(r"\d{3,6}")
@@ -456,29 +458,31 @@ def find_stock_page(code: str, name: str = "") -> dict | None:
     回傳 {'id', 'label', 'concept_ids'} 或 None;concept_ids 為該股「🔗 隸屬概念」的概念頁 ids。
     找不到時會把 CB 還原成現股再試一次(CB 命名=現股名+序號、代號=現股代號+序號),
     這樣「聯電一」「23031」的 CB 事件才連得到主表裡的「2303 聯電」。"""
-    queries = []
     code = (code or "").strip()
     name = (name or "").strip()
     m = _STOCK_CODE_RE.search(code) or _STOCK_CODE_RE.search(name)
+    queries = []  # [(查詢字串, 是否為 CB 後備)]
     if m:
-        queries.append(m.group(0))
+        queries.append((m.group(0), False))
     if name:
-        queries.append(name)
+        queries.append((name, False))
     # 後備:CB → 現股(放最後,先讓精確比對有機會命中)
     for base in (_cb_to_common_code(m.group(0) if m else ""), _cb_to_common_name(name)):
-        if base and base not in queries:
-            queries.append(base)
-    for q in queries:
+        if base and base not in [q for q, _ in queries]:
+            queries.append((base, True))
+    for q, is_fallback in queries:
         data = _post(
             f"/data_sources/{STOCK_DS}/query",
             {"filter": {"property": "Name", "title": {"contains": q}}, "page_size": 5},
         )
-        results = data.get("results", [])
-        if results:
-            page = results[0]
+        for page in data.get("results", []):
             props = page.get("properties", {})
             title = props.get("Name", {}).get("title", [])
             label = "".join(t.get("plain_text", "") for t in title).strip()
+            # CB 後備是模糊比對,只接受「帶 4 碼代號」的真現股。
+            # 否則「博智二」→「博智」會命中主表裡誤建的另一檔 CB「博智三」(無代號)。
+            if is_fallback and not re.search(r"\d{4}", label):
+                continue
             concept_ids = [
                 r["id"] for r in props.get("🔗 隸屬概念", {}).get("relation", []) if r.get("id")
             ]
@@ -887,3 +891,124 @@ def replace_event_stock(event_id: str, old_id: str, new_id: str) -> None:
     ids = _relation_ids(_get(f"/pages/{event_id}"), "🔗 關聯個股")
     ids2 = _dedup([new_id if i == old_id else i for i in ids])
     _patch(f"/pages/{event_id}", {"properties": {"🔗 關聯個股": {"relation": [{"id": i} for i in ids2]}}})
+
+
+# ==========================================================
+# 財報 EPS 庫(EPS_DS):一檔一季一列
+# 累計值 = MOPS 原始申報值(季報本來就是累計數);單季值由本季累計 − 前季累計算出。
+# ==========================================================
+_EPS_TITLE_RE = re.compile(r"(\d{3,6})")
+
+
+def _eps_num(props: dict, name: str):
+    v = props.get(name, {}).get("number")
+    return v
+
+
+def _eps_page_to_dict(page: dict) -> dict:
+    p = page.get("properties", {})
+
+    def txt(k):
+        return "".join(t.get("plain_text", "") for t in p.get(k, {}).get("rich_text", [])).strip()
+
+    q = (p.get("季別", {}).get("select") or {}).get("name", "")
+    return {
+        "id": page["id"],
+        "code": txt("代碼"),
+        "name": txt("公司"),
+        "year": _eps_num(p, "年度"),
+        "quarter": int(q[1:]) if q.startswith("Q") and q[1:].isdigit() else None,
+        "cum_eps": _eps_num(p, "累計EPS"),
+        "q_eps": _eps_num(p, "單季EPS"),
+        "cum_rev": _eps_num(p, "累計營收(億)"),
+        "q_rev": _eps_num(p, "單季營收(億)"),
+        "cum_ni": _eps_num(p, "累計稅後淨利(億)"),
+        "q_ni": _eps_num(p, "單季稅後淨利(億)"),
+        "period": txt("報導期間"),
+        "ann_date": ((p.get("公告日", {}).get("date") or {}).get("start") or ""),
+        "source": (p.get("資料來源", {}).get("select") or {}).get("name", ""),
+        "note": txt("備註"),
+    }
+
+
+def list_eps(code: str = "", year: int | None = None, limit: int = 500) -> list[dict]:
+    """查 EPS 庫。code 給了就只查該檔;回傳依 年度,季別 由新到舊排序。"""
+    filters = []
+    if code:
+        filters.append({"property": "代碼", "rich_text": {"equals": code.strip()}})
+    if year:
+        filters.append({"property": "年度", "number": {"equals": int(year)}})
+    payload: dict = {"page_size": 100}
+    if len(filters) == 1:
+        payload["filter"] = filters[0]
+    elif filters:
+        payload["filter"] = {"and": filters}
+
+    out, cursor = [], None
+    while len(out) < limit:
+        if cursor:
+            payload["start_cursor"] = cursor
+        data = _post(f"/data_sources/{EPS_DS}/query", payload)
+        out.extend(_eps_page_to_dict(pg) for pg in data.get("results", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    out.sort(key=lambda r: (r["year"] or 0, r["quarter"] or 0), reverse=True)
+    return out[:limit]
+
+
+def find_eps_row(code: str, year: int, quarter: int) -> dict | None:
+    data = _post(f"/data_sources/{EPS_DS}/query", {
+        "page_size": 5,
+        "filter": {"and": [
+            {"property": "代碼", "rich_text": {"equals": code.strip()}},
+            {"property": "年度", "number": {"equals": int(year)}},
+            {"property": "季別", "select": {"equals": f"Q{int(quarter)}"}},
+        ]},
+    })
+    rows = data.get("results", [])
+    return _eps_page_to_dict(rows[0]) if rows else None
+
+
+def upsert_eps(code: str, name: str, year: int, quarter: int, *,
+               cum_eps=None, q_eps=None, cum_rev=None, q_rev=None,
+               cum_ni=None, q_ni=None, period: str = "", ann_date: str = "",
+               source: str = "", stock_page_id: str = "", note: str = "",
+               existing: dict | None = None) -> dict:
+    """寫入/更新某檔某季。以 (代碼,年度,季別) 為唯一鍵;None 的欄位不覆蓋既有值。
+    existing 可傳入先前查好的列以省一次 API。回傳 {'id','created':bool}。"""
+    code = (code or "").strip()
+    label = f"{code} {name}".strip()
+    props: dict = {
+        "Name": {"title": [{"text": {"content": f"{label} {int(year)}Q{int(quarter)}"[:200]}}]},
+        "代碼": {"rich_text": [{"text": {"content": code}}]},
+        "年度": {"number": int(year)},
+        "季別": {"select": {"name": f"Q{int(quarter)}"}},
+    }
+    if name:
+        props["公司"] = {"rich_text": [{"text": {"content": name[:100]}}]}
+    for key, val in (("累計EPS", cum_eps), ("單季EPS", q_eps),
+                     ("累計營收(億)", cum_rev), ("單季營收(億)", q_rev),
+                     ("累計稅後淨利(億)", cum_ni), ("單季稅後淨利(億)", q_ni)):
+        if val is not None:
+            props[key] = {"number": round(float(val), 4)}
+    if period:
+        props["報導期間"] = {"rich_text": [{"text": {"content": period[:100]}}]}
+    if ann_date:
+        props["公告日"] = {"date": {"start": ann_date}}
+    if source:
+        props["資料來源"] = {"select": {"name": source}}
+    if note:
+        props["備註"] = {"rich_text": [{"text": {"content": note[:1900]}}]}
+    if stock_page_id:
+        props["🔗關聯個股"] = {"relation": [{"id": stock_page_id}]}
+
+    row = existing if existing is not None else find_eps_row(code, year, quarter)
+    if row:
+        _patch(f"/pages/{row['id']}", {"properties": props})
+        return {"id": row["id"], "created": False}
+    data = _post("/pages", {
+        "parent": {"type": "data_source_id", "data_source_id": EPS_DS},
+        "properties": props,
+    })
+    return {"id": data.get("id", ""), "created": True}
