@@ -142,30 +142,58 @@ def parse_eps_detail(html: str) -> dict | None:
 
 # ---------------------------------------------------------------- 全市場彙總(回補/補漏)
 
-_BULK_ROW_RE = re.compile(r"<tr[^>]*>\s*<td[^>]*>(\d{4})</td>(.*?)</tr>", re.S)
-_BULK_TD_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.S)
+_BULK_HEAD_RE = re.compile(r"<tr[^>]*class=['\"]?tblHead['\"]?[^>]*>.*?</tr>", re.S)
+_BULK_ROW_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S)
+_BULK_TD_RE = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.S)
+
+
+def _cells(html_fragment: str) -> list[str]:
+    return [re.sub(r"<[^>]+>", "", c).replace("&nbsp;", "").strip()
+            for c in _BULK_TD_RE.findall(html_fragment)]
+
+
+def _num(s: str):
+    try:
+        return float(s.replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
 
 
 def fetch_bulk_eps(year: int, quarter: int, typek: str = "sii") -> dict:
-    """抓 MOPS 綜合損益表彙總(t163sb04),回 {code: (name, 累計EPS)}。
+    """抓 MOPS 綜合損益表彙總(t163sb04),回 {code: {'name','eps','ni'}}(ni=歸屬母公司淨利,億元)。
     year 給西元;typek: sii=上市 otc=上櫃。該季尚未公布時回空 dict。
-    ⚠️ 一般業 29 欄、金融業 21 欄,欄位數依業別不同,但**累計基本每股盈餘固定是最後一欄**。"""
+    ⚠️ 同一頁依業別分成好幾張表(一般業 30 欄、金融/證券/保險 18~23 欄),欄位位置**都不一樣**:
+       「淨利(淨損)歸屬於母公司業主」在第 11~23 欄之間浮動。所以逐張表讀自己的表頭定位欄位,
+       不能寫死索引;唯一穩定的只有「基本每股盈餘」永遠是最後一欄。"""
     data = {"encodeURIComponent": "1", "step": "1", "firstin": "1", "off": "1",
             "TYPEK": typek, "year": str(int(year) - 1911), "season": f"{int(quarter):02d}"}
     html = _post_mops(MOPS_BULK_URL, data, timeout=90)
+
     out: dict = {}
-    for code, rest in _BULK_ROW_RE.findall(html):
-        if code in out:  # 同頁多張表時以第一次出現為準
+    heads = list(_BULK_HEAD_RE.finditer(html))
+    for i, h in enumerate(heads):
+        cols = _cells(h.group(0))
+        block = html[h.end():(heads[i + 1].start() if i + 1 < len(heads) else len(html))]
+        eps_i = next((j for j, c in enumerate(cols) if "基本每股盈餘" in c), None)
+        # 認「歸屬於母公司業主」的淨利,排除「綜合損益總額歸屬於母公司業主」(那含未實現損益,
+        # 不是 EPS 的分子)
+        ni_i = next((j for j, c in enumerate(cols)
+                     if "歸屬於母公司業主" in c and "淨利" in c and "綜合損益" not in c), None)
+        if eps_i is None:
             continue
-        cells = [re.sub(r"<[^>]+>", "", c).replace("&nbsp;", "").strip()
-                 for c in _BULK_TD_RE.findall(rest)]
-        if len(cells) < 3:
-            continue
-        try:
-            eps = float(cells[-1].replace(",", ""))
-        except ValueError:
-            continue
-        out[code] = (cells[0], eps)
+        for row in _BULK_ROW_RE.findall(block):
+            cells = _cells(row)
+            if len(cells) != len(cols):
+                continue
+            code = cells[0]
+            if not re.fullmatch(r"\d{4}", code) or code in out:  # 多張表時以第一次出現為準
+                continue
+            eps = _num(cells[eps_i])
+            if eps is None:
+                continue
+            ni = _num(cells[ni_i]) if ni_i is not None else None
+            out[code] = {"name": cells[1], "eps": eps,
+                         "ni": ni / 100000 if ni is not None else None}  # 仟元 → 億元
     return out
 
 
@@ -320,13 +348,22 @@ def backfill(quarters: int = 8, codes: list[str] | None = None,
             if not hit:
                 continue
             row = existing.get((code, y, q))
+            # 已有累計 EPS 就跳過,但淨利是後來才加抓的欄位,缺就補上(反推股數要用)
             if row and row.get("cum_eps") is not None and not overwrite:
-                skipped += 1
+                if hit["ni"] is None or row.get("cum_ni") is not None:
+                    skipped += 1
+                    continue
+                try:
+                    nt.upsert_eps(code, st["name"] or hit["name"], y, q,
+                                  cum_ni=hit["ni"], existing=row)
+                    filled += 1
+                except nt.NotionError as e:
+                    logger.warning("補淨利失敗(%s %dQ%d):%s", code, y, q, e)
                 continue
             try:
                 # existing 傳 {} 代表「已知這季還沒有列」,讓 upsert 直接建頁、省掉一次查詢
-                nt.upsert_eps(code, st["name"] or hit[0], y, q,
-                              cum_eps=hit[1], source="MOPS彙總回補",
+                nt.upsert_eps(code, st["name"] or hit["name"], y, q,
+                              cum_eps=hit["eps"], cum_ni=hit["ni"], source="MOPS彙總回補",
                               stock_page_id=st["id"], existing=row or {})
                 filled += 1
             except nt.NotionError as e:
@@ -379,11 +416,53 @@ def daily_backfill_job() -> dict:
     return res
 
 
+# ---------------------------------------------------------------- 增資偵測
+
+# 年度內加權股數變動超過這個百分比,就認定該年的「累計相減」單季 EPS 不可信
+_SHARE_JUMP_PCT = 5.0
+
+
+def implied_shares(row: dict):
+    """由「累計歸屬母公司淨利 ÷ 累計基本EPS」反推該期間的**加權平均**流通股數(億股)。
+    這正是 EPS 的分母;年度內現金增資/CB 轉股/配股都會讓它逐季墊高。
+    EPS 太接近 0 時商數會爆掉(分母趨近 0),視為不可用。"""
+    ni, eps = row.get("cum_ni"), row.get("cum_eps")
+    if ni is None or eps is None or abs(eps) < 0.1:
+        return None
+    return abs(ni) / abs(eps)
+
+
+def share_change_warnings(rows: list[dict], years: set | None = None) -> list[str]:
+    """挑出「年度內加權股數明顯變動」的年份 —— 那幾年的單季 EPS(累計相減)不能拿來估值。
+    ⚠️ 只有年度**內**的變動才影響相減:Q1 單季=累計不必相減,失真只發生在 Q2~Q4。"""
+    by_year: dict = {}
+    for r in rows:
+        s = implied_shares(r)
+        if s and r.get("year") and r.get("quarter"):
+            by_year.setdefault(r["year"], []).append((r["quarter"], s))
+    out = []
+    for y, items in sorted(by_year.items(), reverse=True):
+        if years is not None and y not in years:
+            continue
+        if len(items) < 2:
+            continue
+        items.sort()
+        first, last = items[0][1], items[-1][1]
+        if not first:
+            continue
+        pct = (last - first) / first * 100
+        if abs(pct) >= _SHARE_JUMP_PCT:
+            out.append(f"⚠️ {y} 加權股數 {first:.2f}→{last:.2f} 億股({pct:+.0f}%),"
+                       f"該年單季 EPS 僅供參考")
+    return out
+
+
 # ---------------------------------------------------------------- 呈現
 
 def format_eps_table(code: str, name: str = "", limit: int = 6) -> str:
     """把某檔的 EPS 表格排成 LINE 訊息(新到舊)。"""
-    rows = nt.list_eps(code=code, limit=limit)
+    all_rows = nt.list_eps(code=code)
+    rows = all_rows[:limit]
     if not rows:
         return f"{code} 目前沒有 EPS 資料。財報公布後會自動抓,或打「EPS 回補」補歷史。"
     title = f"{code} {name or rows[0].get('name', '')}".strip()
@@ -410,7 +489,9 @@ def format_eps_table(code: str, name: str = "", limit: int = 6) -> str:
             total = year_total(y)
             if total:
                 lines.append(total)
-    lines.append("＊=彙總表回補(僅 EPS);單季由累計相減,增資年份會失真")
+    # 增資警示用**全部**季判斷(不只表上顯示的 6 季),否則跨年的股數變化會看不出來
+    lines += share_change_warnings(all_rows, years={r["year"] for r in rows})
+    lines.append("＊=彙總表回補;單季由累計相減")
     return "\n".join(lines)
 
 
