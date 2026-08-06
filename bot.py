@@ -139,7 +139,7 @@ def _reply_eps(reply_token: str, user_id: str, text: str) -> None:
         _say(reply_token, user_id,
              f"⏳ 開始回補{who}近 8 季 EPS,{mins}。\n完成後打「EPS 代號」看表格(不另外推播)。")
         try:
-            res = eps_tracker.backfill(quarters=8, codes=codes)
+            res = eps_tracker.manual_backfill(codes=codes)
             logger.info("EPS 回補完成(%s):%s", who, res)
         except Exception:  # noqa: BLE001
             logger.exception("EPS 回補失敗")
@@ -196,7 +196,7 @@ def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-08-06-eps-subject"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-08-06-eps-catchup"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")

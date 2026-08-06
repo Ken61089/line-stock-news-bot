@@ -31,28 +31,30 @@ MOPS_DETAIL_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t05sr01_1"
 MOPS_BULK_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t163sb04"
 _UA = {"User-Agent": "Mozilla/5.0"}
 
-# 命中條件:主旨提到「財務報(告|表)」+ 一個「這份財報本身被送出」的動詞。
-# 各家寫法不一,實際看過的長相:
+# 命中條件:主旨提到「財務報(告|表)」+ **指明是哪一期的財報**(或帶送出動詞)。
+# 各家寫法差很多,實際看過的長相:
+#   「公告本公司115年第2季合併財務報告」                  ← 4991 環宇-KY,**完全沒有動詞**
 #   「公告本公司115年度第二季合併財務報告業經董事會決議通過」
 #   「公告本公司董事會通過115年第2季合併財務報告」
-#   「公告本公司提報董事會115年第2季合併財務報告」      ← 沒有「通過」二字
-#   「公告本公司115年第二季合併財務報告業經提報董事會」  ← 同上
-#   「公告本公司於董事會提報115年第2季合併財務報告」      ← 同上
-# ⚠️ 動詞是必要的,不能只看「財務報告」四個字 —— 否則會吃進兩類雜訊:
-#   ①「財務報告董事會**召開日期**/預計召開日期」的預告(某日 730 則重訊裡財報相關 238 則,
-#      多數是這種),點進去沒有數字;
-#   ②「新增資金貸與/背書保證金額達最近期**財務報表淨值**百分之二」這種只是拿財報當門檻的
-#      公告,跟財報內容無關。兩者都會白抓詳細頁。
+#   「公告本公司提報董事會115年第2季合併財務報告」
+#   「公告本公司115年第二季合併財務報告業經提報董事會」
+#   「公告本公司於董事會提報115年第2季合併財務報告」
+# ⚠️ 所以**不能要求動詞**(會漏掉第一種),但也**不能只看「財務報告」四個字** ——
+#   否則會吃進「新增資金貸與/背書保證金額達**最近期財務報表**淨值百分之二」這種只是拿
+#   財報當門檻的公告(實測某日混入 7 則)。分界在**有沒有指明期別**:真財報公告一定寫
+#   「第X季」或「年度」,雜訊寫的是「最近期財務報表」這種修飾語。
 _FIN_SUBJ_RE = re.compile(r"財務報(?:告|表)")
+_FIN_PERIOD_RE = re.compile(r"第[一二三四1-4]季|年度(?:合併)?財務報")
 _FIN_ACTION_RE = re.compile(r"通過|提報|決議")
-_FIN_EXCLUDE_RE = re.compile(r"召開|預計|財務預測|自結")
+# 「召開/預計」是董事會開會日期的預告(點進去沒數字);「最近期」是上面那種引用型公告
+_FIN_EXCLUDE_RE = re.compile(r"召開|預計|財務預測|自結|最近期")
 
 
 def is_financial_report_subject(subject: str) -> bool:
     s = (subject or "").replace(" ", "")
-    if not _FIN_SUBJ_RE.search(s) or not _FIN_ACTION_RE.search(s):
+    if not _FIN_SUBJ_RE.search(s) or _FIN_EXCLUDE_RE.search(s):
         return False
-    return not _FIN_EXCLUDE_RE.search(s)
+    return bool(_FIN_PERIOD_RE.search(s) or _FIN_ACTION_RE.search(s))
 
 
 # ---------------------------------------------------------------- 詳細頁
@@ -88,6 +90,56 @@ def fetch_announcement_detail(row: dict) -> str:
         "SEQ_NO": row.get("seq_no", ""),
     }
     return _post_mops(MOPS_DETAIL_URL, data, timeout=40)
+
+
+# ---------------------------------------------------------------- 歷史重訊(補漏第三線)
+
+MOPS_HIST_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t05st01"
+_HIST_TR_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S)
+_HIST_PARAM_RE = re.compile(r"(\w+)\.value='([^']*)'")
+
+
+def fetch_history_announcements(code: str, roc_year: int) -> list[dict]:
+    """查某公司某民國年的**全部**重訊(t05st01),回 [{code,name,date,time,subject,+詳細頁參數}]。
+
+    為什麼需要這條:重訊主線只看 `t05sr01_1` 的**當日**列表,前一天發的、或機器人重啟
+    重建基準那段錯過的,就再也看不到;而 t163sb04 彙總表有數日延遲
+    (4991 環宇-KY 8/5 就申報 Q2,8/6 查彙總表仍然沒有)。這條可以精準補。
+    ⚠️ 這個端點的參數名是**小寫**(seq_no/spoke_date/spoke_time/co_id),
+    與即時列表的大寫 SEQ_NO/SPOKE_DATE 不同,不能共用。"""
+    data = {"step": "1", "firstin": "true", "off": "1", "TYPEK": "all",
+            "co_id": code, "year": str(roc_year), "month": "", "b_date": "", "e_date": "",
+            "queryName": "co_id", "inpuType": "co_id"}
+    html = _post_mops(MOPS_HIST_URL, data, timeout=40)
+    out = []
+    for tr in _HIST_TR_RE.findall(html):
+        p = dict(_HIST_PARAM_RE.findall(tr))
+        if "seq_no" not in p or "spoke_date" not in p:
+            continue
+        cells = [re.sub(r"<[^>]+>", "", c).replace("&nbsp;", "").strip()
+                 for c in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+        if len(cells) < 5:
+            continue
+        out.append({
+            "code": cells[0], "name": cells[1], "date": cells[2], "time": cells[3],
+            "subject": re.sub(r"\s+", " ", cells[4]).strip(),
+            "co_id": p.get("co_id", code), "seq_no": p.get("seq_no", ""),
+            "spoke_date": p.get("spoke_date", ""), "spoke_time": p.get("spoke_time", ""),
+            "typek": p.get("TYPEK", "all"), "year": str(roc_year),
+        })
+    return out
+
+
+def fetch_history_detail(row: dict) -> str:
+    """抓歷史重訊的詳細內容。⚠️ `step` 必須是 **2**(form 裡寫死的),給 1 會回列表而不是內文。"""
+    data = {"step": "2", "off": "1", "firstin": "true", "b_date": "", "e_date": "",
+            "TYPEK": row.get("typek", "all"), "year": row.get("year", ""),
+            "month": "all", "e_month": "all", "type": "",
+            "co_id": row.get("co_id", row.get("code", "")),
+            "spoke_date": row.get("spoke_date", ""),
+            "spoke_time": row.get("spoke_time", ""),
+            "seq_no": row.get("seq_no", "")}
+    return _post_mops(MOPS_HIST_URL, data, timeout=40)
 
 
 def _find_num(html: str, label: str):
@@ -128,8 +180,10 @@ def parse_eps_detail(html: str) -> dict | None:
     抽不到報導期間或 EPS 就回 None(代表不是財報通過那類重訊,或格式不符)。"""
     text = re.sub(r"<[^>]+>", "\n", html)
     text = re.sub(r"&nbsp;", " ", text)
-    # 只取「報導期間」那行,避免抓到事實發生日等其他日期
-    m = re.search(r"報導期間[^\n]*\n?[^\n]*", text)
+    # 從「報導期間」往後找日期區間,避免抓到事實發生日等其他單一日期。
+    # ⚠️ 要跨行找:即時頁把日期寫在「起訖日期(XXX/XX/XX~XXX/XX/XX):」同一行,
+    #   歷史頁(t05st01)卻換行寫在下一行 —— 只看一行會抓到那串 XXX 格式說明而失敗。
+    m = re.search(r"報導期間.{0,200}", text, re.S)
     year, quarter, period = _period_to_year_quarter(m.group(0) if m else "")
     if not year:
         return None
@@ -467,6 +521,60 @@ def sync_latest_quarter() -> dict:
     return res
 
 
+def catch_up_from_history(year: int, quarter: int, codes: list[str] | None = None) -> dict:
+    """對「該季還沒有 EPS」的追蹤股,逐檔查 MOPS 歷史重訊補抓。
+
+    這是第三道防線,補的是前兩道都碰不到的洞:
+      主線只看當日列表(前一天發的看不到)、彙總表有數日延遲(4991 8/5 申報、8/6 仍未收錄)。
+    成本與缺的檔數成正比(一檔一次列表查詢),所以放在彙總表補完之後、只處理仍缺的。"""
+    idx = _stock_index()
+    if codes:
+        idx = {c: v for c, v in idx.items() if c in codes}
+    have = {r["code"] for r in nt.list_eps(limit=2000)
+            if r["year"] == year and r["quarter"] == quarter and r["cum_eps"] is not None}
+    missing = sorted(c for c in idx if c not in have)
+    if not missing:
+        return {"missing": 0, "found": 0}
+
+    # 財報公告的發布年:Q1~Q3 是同年,Q4(年報)要到隔年才公布
+    roc_year = (year + 1 if quarter == 4 else year) - 1911
+    found, touched = 0, []
+    for code in missing:
+        try:
+            rows = fetch_history_announcements(code, roc_year)
+        except (httpx.HTTPError, RuntimeError) as e:
+            logger.warning("查歷史重訊失敗(%s):%s", code, e)
+            continue
+        fin = [r for r in rows if is_financial_report_subject(r["subject"])]
+        for r in reversed(fin):  # 由新到舊,命中就停
+            try:
+                detail = parse_eps_detail(fetch_history_detail(r))
+            except (httpx.HTTPError, RuntimeError):
+                continue
+            if not detail or (detail["year"], detail["quarter"]) != (year, quarter):
+                continue
+            st = idx[code]
+            try:
+                nt.upsert_eps(code, st["name"] or r["name"], year, quarter,
+                              cum_eps=detail["cum_eps"], cum_rev=detail["cum_rev"],
+                              cum_ni=detail["cum_ni"], period=detail["period"],
+                              ann_date=_roc_to_iso(r["date"]), source="重訊詳細頁",
+                              stock_page_id=st["id"], note=r["subject"][:200])
+                found += 1
+                touched.append(code)
+            except nt.NotionError as e:
+                logger.warning("補抓寫入失敗(%s):%s", code, e)
+            break
+        time.sleep(0.4)  # 對 MOPS 客氣一點
+    for code in sorted(set(touched)):
+        try:
+            recompute_quarterly(code)
+        except nt.NotionError as e:
+            logger.warning("重算單季失敗(%s):%s", code, e)
+    logger.info("EPS 歷史補抓 %dQ%d:缺 %d 檔,補到 %d 檔", year, quarter, len(missing), found)
+    return {"missing": len(missing), "found": found, "codes": sorted(set(touched))}
+
+
 def sync_new_stocks(quarters: int = 8) -> dict:
     """把「主表有、EPS 庫卻完全沒資料」的個股補上近 N 季。
 
@@ -486,13 +594,31 @@ def sync_new_stocks(quarters: int = 8) -> dict:
 
 
 def daily_backfill_job() -> dict:
-    """每日排程進入點:只在財報公布窗口內跑一次兜底補漏(補沒發重訊、只默默申報的公司)。"""
+    """每日排程進入點:只在財報公布窗口內跑一次兜底補漏(補沒發重訊、只默默申報的公司)。
+    兩段:先用彙總表(便宜,一次全市場),仍缺的再逐檔查歷史重訊(精準,補彙總表的延遲)。"""
     target = _window_target(datetime.date.today())
     if not target:
         return {"skipped": "非財報公布窗口"}
     res = backfill(qs=[target])
     res["target"] = f"{target[0]}Q{target[1]}"
+    try:
+        res["catchup"] = catch_up_from_history(target[0], target[1])
+    except Exception as e:  # noqa: BLE001 補抓失敗不該讓整個兜底任務失敗
+        logger.warning("EPS 歷史補抓失敗:%s", e)
     logger.info("EPS 兜底補漏:%s", res)
+    return res
+
+
+def manual_backfill(codes: list[str] | None = None, quarters: int = 8) -> dict:
+    """LINE「EPS 回補」用:彙總表回補 + 對當季仍缺的逐檔查歷史重訊補。
+    彙總表有數日延遲,少了第二段的話「昨天剛公布」的那幾檔會回補不到。"""
+    res = backfill(quarters=quarters, codes=codes)
+    target = _window_target(datetime.date.today())
+    if target:
+        try:
+            res["catchup"] = catch_up_from_history(target[0], target[1], codes=codes)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("EPS 歷史補抓失敗:%s", e)
     return res
 
 
