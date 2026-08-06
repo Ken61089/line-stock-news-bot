@@ -29,6 +29,7 @@ from news_processor import route_and_store, NoCategoryError, is_group_additive_c
 import calendar_notify
 import fetchers
 import eps_tracker
+import price_alerts
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -153,6 +154,17 @@ def _reply_eps(reply_token: str, user_id: str, text: str) -> None:
         _say(reply_token, user_id, reply)
 
 
+# ---- 背景執行「提醒」設定/查詢並回覆 ----
+def _reply_alert(reply_token: str, user_id: str, text: str) -> None:
+    try:
+        reply = price_alerts.run_alert_command(text)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("提醒指令失敗")
+        reply = f"❌ 提醒指令失敗:{e}"
+    if reply:
+        _say(reply_token, user_id, reply)
+
+
 # ---- 背景執行「列出事件」查詢並回覆 ----
 def _reply_list_events(reply_token: str, user_id: str, text: str) -> None:
     try:
@@ -196,7 +208,7 @@ def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-08-06-eps-catchup"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-08-06-alerts"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
@@ -318,6 +330,19 @@ def callback():
                 continue
             threading.Thread(
                 target=_reply_eps,
+                args=(reply_token, user_id, text),
+                daemon=True,
+            ).start()
+            continue
+
+        # 「提醒 大盤 跌 1000 …」設盤中事件提醒;「提醒清單」/「刪提醒 N」管理。
+        # 觸發時推的是本人私訊,所以設定也限本人(免得群組成員設了卻推到我這裡)。
+        if price_alerts.is_alert_command(text):
+            if ALLOWED_USER_ID and user_id != ALLOWED_USER_ID:
+                _say(reply_token, user_id, "「提醒」僅限本人設定。")
+                continue
+            threading.Thread(
+                target=_reply_alert,
                 args=(reply_token, user_id, text),
                 daemon=True,
             ).start()

@@ -750,6 +750,15 @@ def maybe_start_scheduler() -> None:
             id="eps_new_stocks", replace_existing=True,
         )
         fetch_log += "、每週日 22:50 補新追蹤股 EPS 歷史"
+        # 盤中事件提醒:週一~週五 09:00-13:45 每 15 分鐘比對一次即時報價。
+        # 13:45 那次拿到的是收盤值,收盤才跌破的情況也接得住。
+        import price_alerts
+        sched.add_job(
+            _safe(price_alerts.check_alerts),
+            CronTrigger(day_of_week="mon-fri", hour="9-13", minute="*/15", timezone=tz),
+            id="price_alerts", replace_existing=True,
+        )
+        fetch_log += "、盤中每 15 分鐘檢查事件提醒"
     except Exception:  # noqa: BLE001
         logger.exception("fetchers 掛載失敗,法說會自動抓取不啟用")
         fetch_log = ""
