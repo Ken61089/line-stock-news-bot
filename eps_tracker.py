@@ -43,11 +43,17 @@ _UA = {"User-Agent": "Mozilla/5.0"}
 #   否則會吃進「新增資金貸與/背書保證金額達**最近期財務報表**淨值百分之二」這種只是拿
 #   財報當門檻的公告(實測某日混入 7 則)。分界在**有沒有指明期別**:真財報公告一定寫
 #   「第X季」或「年度」,雜訊寫的是「最近期財務報表」這種修飾語。
-_FIN_SUBJ_RE = re.compile(r"財務報(?:告|表)")
-_FIN_PERIOD_RE = re.compile(r"第[一二三四1-4]季|年度(?:合併)?財務報")
+#   「本公司董事會通過115年第2季自結財務資訊」               ← 自結,注意是「財務**資訊**」
+# 自結數與正式財報**共用同一個詳細頁表格**(欄位名寫的是「財務報告或年度自結財務資訊
+# 報導期間」),所以內容解析完全通用,只是主旨用詞不同、且數字未經會計師核閱。
+# 「自結財務資訊」中間常插字:自結**合併**財務資訊、自結**個體**財務資訊
+_FIN_SUBJ_RE = re.compile(r"財務報(?:告|表)|自結.{0,3}財務資訊")
+_FIN_PERIOD_RE = re.compile(r"第[一二三四1-4]季|年度(?:合併)?財務報|年度自結")
 _FIN_ACTION_RE = re.compile(r"通過|提報|決議")
-# 「召開/預計」是董事會開會日期的預告(點進去沒數字);「最近期」是上面那種引用型公告
-_FIN_EXCLUDE_RE = re.compile(r"召開|預計|財務預測|自結|最近期")
+# 「召開/預計」是董事會開會日期的預告(點進去沒數字);「最近期」是引用型公告;
+# 「財務預測」是財測不是實績。⚠️「自結」不能整個排除 —— 自結財務資訊有正式的數字表格。
+_FIN_EXCLUDE_RE = re.compile(r"召開|預計|財務預測|最近期")
+_SELF_SETTLED_RE = re.compile(r"自結")
 
 
 def is_financial_report_subject(subject: str) -> bool:
@@ -55,6 +61,11 @@ def is_financial_report_subject(subject: str) -> bool:
     if not _FIN_SUBJ_RE.search(s) or _FIN_EXCLUDE_RE.search(s):
         return False
     return bool(_FIN_PERIOD_RE.search(s) or _FIN_ACTION_RE.search(s))
+
+
+def is_self_settled(subject: str) -> bool:
+    """是否為自結數(未經會計師核閱)。自結先出、正式財報後到,同一季會有兩個版本。"""
+    return bool(_SELF_SETTLED_RE.search((subject or "").replace(" ", "")))
 
 
 # ---------------------------------------------------------------- 詳細頁
@@ -163,7 +174,11 @@ _PERIOD_RE = re.compile(r"(\d{2,3})/(\d{2})/(\d{2})\s*[~\-–至]\s*(\d{2,3})/(\
 
 def _period_to_year_quarter(text: str):
     """從報導期間起訖(民國)判斷 (西元年, 季)。認結束月:3→Q1 6→Q2 9→Q3 12→Q4。
-    非曆年制或格式異常回 (None, None, '')。"""
+    非曆年制或格式異常回 (None, None, '')。
+
+    ⚠️ **起始日必須是 01/01** —— 季報是「1月1日累計至本期止」。自結數有單月版本
+    (例如期間 115/06/01~115/06/30),結束月同樣是 6,不檢查起始日的話會被誤當成
+    Q2 累計寫進去,那個數字只有一個月、比真正的半年累計小得多。"""
     m = _PERIOD_RE.search(text or "")
     if not m:
         return None, None, ""
@@ -171,6 +186,8 @@ def _period_to_year_quarter(text: str):
     period = f"{y1}/{m1}/{d1}-{y2}/{m2}/{d2}"
     end_m = int(m2)
     if end_m not in (3, 6, 9, 12):
+        return None, None, period
+    if (int(m1), int(d1)) != (1, 1):
         return None, None, period
     return int(y2) + 1911, end_m // 3, period
 
@@ -375,13 +392,21 @@ def handle_financial_announcements(rows: list[dict], stock_idx: dict | None = No
             logger.info("重訊非財報格式或抽不到 EPS,略過:%s %s", code, r.get("subject", "")[:40])
             continue
         st = idx[code]
+        # 自結數未經會計師核閱,只在該季還沒有任何數字時才寫;正式財報一到就會蓋過去。
+        self_settled = is_self_settled(r.get("subject", ""))
+        if self_settled:
+            row = nt.find_eps_row(code, detail["year"], detail["quarter"])
+            if row and row.get("cum_eps") is not None and row.get("source") != "自結數":
+                logger.info("%s %dQ%d 已有正式數字,略過自結", code, detail["year"], detail["quarter"])
+                continue
         try:
             nt.upsert_eps(
                 code, st["name"] or r.get("name", ""), detail["year"], detail["quarter"],
                 cum_eps=detail["cum_eps"], cum_rev=detail["cum_rev"], cum_ni=detail["cum_ni"],
                 period=detail["period"],
                 ann_date=_roc_to_iso(r.get("date", "")),
-                source="重訊詳細頁", stock_page_id=st["id"],
+                source="自結數" if self_settled else "重訊詳細頁",
+                stock_page_id=st["id"],
                 note=r.get("subject", "")[:200],
             )
             saved += 1
@@ -464,8 +489,10 @@ def backfill(quarters: int = 8, codes: list[str] | None = None,
             if not hit:
                 continue
             row = existing.get((code, y, q))
-            # 已有累計 EPS 就跳過,但淨利是後來才加抓的欄位,缺就補上(反推股數要用)
-            if row and row.get("cum_eps") is not None and not overwrite:
+            # 已有累計 EPS 就跳過,但淨利是後來才加抓的欄位,缺就補上(反推股數要用)。
+            # ⚠️ 自結數是例外:彙總表是正式申報值,要讓它蓋掉未經核閱的自結。
+            if (row and row.get("cum_eps") is not None and not overwrite
+                    and row.get("source") != "自結數"):
                 if hit["ni"] is None or row.get("cum_ni") is not None:
                     skipped += 1
                     continue
@@ -558,7 +585,8 @@ def catch_up_from_history(year: int, quarter: int, codes: list[str] | None = Non
                 nt.upsert_eps(code, st["name"] or r["name"], year, quarter,
                               cum_eps=detail["cum_eps"], cum_rev=detail["cum_rev"],
                               cum_ni=detail["cum_ni"], period=detail["period"],
-                              ann_date=_roc_to_iso(r["date"]), source="重訊詳細頁",
+                              ann_date=_roc_to_iso(r["date"]),
+                              source="自結數" if is_self_settled(r["subject"]) else "重訊詳細頁",
                               stock_page_id=st["id"], note=r["subject"][:200])
                 found += 1
                 touched.append(code)
@@ -718,7 +746,7 @@ def format_eps_table(code: str, name: str = "", limit: int = 6) -> str:
         # Q1 的單季直接等於累計、不做相減,所以不會有估算問題,不標記
         if q > 1 and r["q_eps"] is not None and basis_changed(r, by_q.get(_prev_quarter(y, q))):
             single += "~"  # 該季股數有變,單季值是用淨利回推的估算
-        mark = "" if r["source"] == "重訊詳細頁" else "*"
+        mark = {"重訊詳細頁": "", "自結數": "自"}.get(r["source"], "*")
         lines.append(f"{y}Q{q}｜{single}｜{cum}{mark}")
         is_last_of_year = i + 1 == len(rows) or rows[i + 1]["year"] != y
         if is_last_of_year:
@@ -732,6 +760,8 @@ def format_eps_table(code: str, name: str = "", limit: int = 6) -> str:
     lines += share_change_warnings(all_rows,
                                    years={r["year"] for r in rows} - break_years)
     legend = "＊=彙總表回補;單季由累計相減"
+    if any("自" in ln.split("｜")[-1] for ln in lines if "｜" in ln):
+        legend += "\n自=自結數(未經會計師核閱),正式財報出來會自動蓋掉"
     if any("~" in ln for ln in lines):
         legend += "\n~=該季股數有變,單季改用淨利÷加權股數回推"
     lines.append(legend)
