@@ -122,7 +122,10 @@ def list_alerts(only_enabled: bool = False) -> list[dict]:
 
 
 def add_alert(code: str, market: str, cond: str, threshold: float, content: str,
-              stock_page_id: str = "", repeat: str = "每日一次") -> dict:
+              stock_page_id: str = "", repeat: str = "只觸發一次") -> dict:
+    """預設**只觸發一次**:推播後自動停用,要再用打「開提醒 N」。
+    這是為了守 LINE 免費額度 —— 條件一旦成立往往會**持續成立**(大盤跌破某點位後
+    可能連跌好幾天),設「每日一次」的話每天都會再推一則。"""
     label = "大盤" if code == INDEX_CODE else code
     unit = "點" if code == INDEX_CODE else "元"
     title = (f"{label} {cond.replace('N點', '')}{threshold:g}{unit}"
@@ -250,9 +253,11 @@ def check_alerts() -> dict:
         if not hit:
             continue
         label = "大盤" if a["code"] == INDEX_CODE else f"{a['code']} {q['name']}"
+        tail = ("\n\n(這條已自動停用,要再用打「開提醒 N」)"
+                if a["repeat"] == "只觸發一次" else "")
         text = (f"🔔 {a['title']}\n"
                 f"{label} 現在 {detail}  {q.get('time', '')}\n"
-                f"────────\n{a['content']}")
+                f"────────\n{a['content']}{tail}")
         _push(text)
         try:
             mark_fired(a, today_iso)
@@ -277,17 +282,18 @@ _USAGE = (
     "• 跌/漲 = 當日漲跌幅(以昨收為基準)\n"
     "• 破/站上 = 絕對價位\n"
     "\n"
-    "列出:提醒清單    刪除:刪提醒 2\n"
-    "盤中每 15 分鐘檢查,觸發推你私訊;同一條每天只推一次。"
+    "列出:提醒清單    刪除:刪提醒 2    重新啟用:開提醒 2\n"
+    "盤中每 15 分鐘檢查,觸發推你私訊 **一次** 後自動停用(省 LINE 額度)。"
 )
-_CMD_RE = re.compile(r"^提醒\s+(\S+)\s*(跌|漲|破|站上)\s*([\d,\.]+)\s+(.+)$", re.S)
+# 容錯:空格可有可無(「大盤跌1000 打BBU」也通)、數字可帶逗號、後面可以接單位
+_CMD_RE = re.compile(r"^提醒\s+(\S+?)\s*(跌|漲|破|站上)\s*([\d,\.]+)\s*(?:點|元|塊)?\s+(.+)$", re.S)
 _COND_MAP = {"跌": "當日跌N點", "漲": "當日漲N點", "破": "跌破", "站上": "漲破"}
 
 
 def is_alert_command(text: str) -> bool:
     t = (text or "").strip()
     first = t.splitlines()[0].strip() if t else ""
-    return first.startswith("提醒") or first.startswith("刪提醒")
+    return first.startswith(("提醒", "刪提醒", "開提醒", "重啟提醒"))
 
 
 def run_alert_command(text: str) -> str:
@@ -303,6 +309,17 @@ def run_alert_command(text: str) -> str:
         nt.archive_page(a["id"])
         return f"🗑️ 已刪除:{a['title']}"
 
+    if first.startswith("開提醒") or first.startswith("重啟提醒"):
+        arg = re.sub(r"^(開提醒|重啟提醒)", "", first).strip()
+        alerts = list_alerts()
+        if not arg.isdigit() or not (1 <= int(arg) <= len(alerts)):
+            return f"用法:開提醒 <編號>(目前共 {len(alerts)} 條,打「提醒清單」看編號)"
+        a = alerts[int(arg) - 1]
+        # 一併清掉最後觸發日,否則同一天內重新啟用會被「今天推過了」擋掉
+        nt._patch(f"/pages/{a['id']}",
+                  {"properties": {"啟用": {"checkbox": True}, "最後觸發日": {"date": None}}})
+        return f"🔔 已重新啟用:{a['title']}\n   → {a['content'][:60]}"
+
     arg = first[len("提醒"):].strip()
     if not arg or arg in ("用法", "說明", "help", "?"):
         return _USAGE
@@ -310,12 +327,15 @@ def run_alert_command(text: str) -> str:
         alerts = list_alerts()
         if not alerts:
             return "目前沒有設定任何提醒。打「提醒 用法」看怎麼設。"
-        lines = [f"🔔 事件提醒({len(alerts)} 條)"]
+        on = sum(1 for a in alerts if a["enabled"])
+        lines = [f"🔔 事件提醒({len(alerts)} 條,{on} 條監看中)"]
         for i, a in enumerate(alerts, 1):
-            mark = "" if a["enabled"] else "(已停用)"
-            last = f" 上次 {a['last_fired']}" if a["last_fired"] else ""
-            lines.append(f"{i}. {a['title']}{mark}{last}\n   → {a['content'][:40]}")
-        lines.append("刪除:刪提醒 編號")
+            if a["enabled"]:
+                state = "🟢"
+            else:
+                state = f"⚪ 已觸發 {a['last_fired']}" if a["last_fired"] else "⚪ 停用中"
+            lines.append(f"{i}. {state} {a['title']}\n   → {a['content'][:40]}")
+        lines.append("重新啟用:開提醒 編號    刪除:刪提醒 編號")
         return "\n".join(lines)
 
     m = _CMD_RE.match(t.replace("　", " "))
@@ -331,7 +351,15 @@ def run_alert_command(text: str) -> str:
         sp = nt.find_stock_page(code, "")
         stock_id = sp["id"] if sp else ""
     else:
-        return f"看不懂標的「{target}」。用「大盤」或四碼股號,例:提醒 2330 跌 100 …"
+        # 也接受個股名稱(要在主表裡才查得到代號)
+        sp = nt.find_stock_page("", target)
+        if not sp:
+            return (f"看不懂標的「{target}」。用「大盤」或股號,例:提醒 2330 跌 100 …\n"
+                    f"(用名稱的話,那檔要先在個股主表裡)")
+        m2 = re.search(r"\d{3,6}", sp.get("label", ""))
+        if not m2:
+            return f"「{target}」在主表裡沒有代號,請改用股號。"
+        code, stock_id = m2.group(0), sp["id"]
 
     market = resolve_market(code)
     try:
@@ -345,4 +373,4 @@ def run_alert_command(text: str) -> str:
         now = f"\n目前 {q['price']:,.2f}{unit}(昨收 {q.get('prev_close', 0):,.2f})"
     return (f"✅ 已設定:{res['title']}{now}\n"
             f"觸發時會推你私訊:\n{content.strip()[:80]}\n"
-            f"(盤中每 15 分鐘檢查,同一條每天只推一次)")
+            f"(盤中每 15 分鐘檢查,推一次後自動停用;要再用打「開提醒 編號」)")

@@ -208,7 +208,7 @@ def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-08-06-alerts"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-08-07-alerts"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
