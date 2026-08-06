@@ -31,19 +31,26 @@ MOPS_DETAIL_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t05sr01_1"
 MOPS_BULK_URL = "https://mopsov.twse.com.tw/mops/web/ajax_t163sb04"
 _UA = {"User-Agent": "Mozilla/5.0"}
 
-# 命中條件:主旨同時提到「財務報(告|表)」與「通過」。
-# 實際主旨長相:「公告本公司115年度第二季合併財務報告業經董事會決議通過」
-#               「公告本公司董事會通過115年第2季合併財務報告」
-# ⚠️同一天還有大量「財務報告董事會**召開日期**/預計召開日期」的預告(115/08/04 那天 617 則
-#   重訊裡財報相關 333 則、其中多數是預告),那些點進去沒有數字,必須用「通過」+排除「召開」
-#   濾掉,否則會白抓一堆詳細頁。
+# 命中條件:主旨提到「財務報(告|表)」+ 一個「這份財報本身被送出」的動詞。
+# 各家寫法不一,實際看過的長相:
+#   「公告本公司115年度第二季合併財務報告業經董事會決議通過」
+#   「公告本公司董事會通過115年第2季合併財務報告」
+#   「公告本公司提報董事會115年第2季合併財務報告」      ← 沒有「通過」二字
+#   「公告本公司115年第二季合併財務報告業經提報董事會」  ← 同上
+#   「公告本公司於董事會提報115年第2季合併財務報告」      ← 同上
+# ⚠️ 動詞是必要的,不能只看「財務報告」四個字 —— 否則會吃進兩類雜訊:
+#   ①「財務報告董事會**召開日期**/預計召開日期」的預告(某日 730 則重訊裡財報相關 238 則,
+#      多數是這種),點進去沒有數字;
+#   ②「新增資金貸與/背書保證金額達最近期**財務報表淨值**百分之二」這種只是拿財報當門檻的
+#      公告,跟財報內容無關。兩者都會白抓詳細頁。
 _FIN_SUBJ_RE = re.compile(r"財務報(?:告|表)")
+_FIN_ACTION_RE = re.compile(r"通過|提報|決議")
 _FIN_EXCLUDE_RE = re.compile(r"召開|預計|財務預測|自結")
 
 
 def is_financial_report_subject(subject: str) -> bool:
     s = (subject or "").replace(" ", "")
-    if not _FIN_SUBJ_RE.search(s) or "通過" not in s:
+    if not _FIN_SUBJ_RE.search(s) or not _FIN_ACTION_RE.search(s):
         return False
     return not _FIN_EXCLUDE_RE.search(s)
 
@@ -84,14 +91,19 @@ def fetch_announcement_detail(row: dict) -> str:
 
 
 def _find_num(html: str, label: str):
-    """抓「…label…:數字」。MOPS 各業別的欄位編號不同,所以認文字不認編號。"""
-    m = re.search(label + r"[^:：]{0,20}[:：]\s*([\-\d,\.]+)", html)
+    """抓「…label…:數字」。MOPS 各業別的欄位編號不同,所以認文字不認編號。
+    ⚠️ **負數是用會計括號寫的**,不是負號 —— 春雨 2012 的 2026Q2 EPS 申報成 `(0.19)`、
+    淨利 `(52,312)`。只認 `-` 的話**所有虧損季都會抽不到**(整則被當成格式不符略過)。"""
+    m = re.search(label + r"[^:：]{0,20}[:：]\s*(\(?-?[\d,]+(?:\.\d+)?\)?)", html)
     if not m:
         return None
+    raw = m.group(1).strip()
+    neg = raw.startswith("(") and raw.endswith(")")
     try:
-        return float(m.group(1).replace(",", ""))
+        v = float(raw.strip("()").replace(",", ""))
     except ValueError:
         return None
+    return -v if neg else v
 
 
 _PERIOD_RE = re.compile(r"(\d{2,3})/(\d{2})/(\d{2})\s*[~\-–至]\s*(\d{2,3})/(\d{2})/(\d{2})")
