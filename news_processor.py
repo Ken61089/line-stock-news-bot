@@ -122,7 +122,14 @@ def _ensure_month_loaded() -> None:
 
 
 def _ai_chat(**kwargs):
-    """呼叫 AI Hub 並把 token 用量累加到當月、write-through 寫回 Notion。用法同 create。"""
+    """呼叫 AI Hub 並把 token 用量累加到當月、write-through 寫回 Notion。用法同 create。
+
+    ⚠️ 預設 `temperature=0`:這裡的用途全是**結構化資料抽取**(從新聞抽個股/概念/時程),
+    要的是同一篇文章每次都給同一個答案,不是創意。OpenAI 相容介面沒指定時預設 1.0,
+    等於讓模型每次都擲骰子 —— 2026-08 就出過一次:同一篇衛司特(6894)法說新聞被抽成
+    「6570」+ 石英元件/CPO 等原文完全沒有的題材,事後用同樣輸入重跑卻都正確。
+    呼叫端仍可自行覆寫。"""
+    kwargs.setdefault("temperature", 0)
     completion = _get_ai_client().chat.completions.create(**kwargs)
     try:
         u = completion.usage
