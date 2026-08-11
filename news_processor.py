@@ -10,6 +10,7 @@
 import os
 import re
 import json
+import logging
 import threading
 import datetime
 from dataclasses import dataclass
@@ -20,6 +21,10 @@ from pydantic import BaseModel, ValidationError, model_validator
 
 from web_fetch import fetch_article, FetchError
 import notion_timeline
+
+# ⚠️ 這個模組用了 24 處 logger 卻一直沒定義,例外路徑(抓文失敗、Notion 寫入失敗…)
+# 一走到就 NameError,被上層 except 吞成空泛的「處理失敗」,真正的原因反而看不到。
+logger = logging.getLogger("line-news-bot.news")
 
 # ==========================================================
 # 設定
@@ -846,6 +851,33 @@ def detect_category(text: str):
 # ==========================================================
 # 呼叫 AI 做結構化整理
 # ==========================================================
+_STOCK_ITEM_RE = re.compile(r"^(\d{3,6})\s*(.*)$")
+
+
+def verify_stock_codes(stocks: list, source_text: str) -> tuple:
+    """把「代號沒在原文出現過」的個股拿掉代號、只留公司名。回 (清理後清單, 被拿掉的說明)。
+
+    ⚠️ 這是硬防護,不倚賴模型自律:AI 認得公司名卻不知道代號時會**憑印象填一個**,
+    而代號一旦錯了,之後這檔的新聞、財報、EPS 全會掛到別家公司身上
+    (2026-08 踩過:主表的「3054 力旺」「6756 達發」都是這樣來的,力旺其實是 3529、
+    達發是 6526,回補了八季 EPS 才發現數字是立萬利與威鋒的)。"""
+    cleaned, dropped = [], []
+    for item in stocks or []:
+        m = _STOCK_ITEM_RE.match((item or "").strip())
+        if not m:
+            cleaned.append(item)
+            continue
+        code, name = m.group(1), m.group(2).strip()
+        if code in source_text:
+            cleaned.append(item)
+        elif name:
+            cleaned.append(name)  # 代號可疑就只留名稱,後續才不會掛錯檔
+            dropped.append(f"{code} {name}")
+        else:
+            dropped.append(code)
+    return cleaned, dropped
+
+
 def _analyze(cfg: CategoryConfig, title: str, content: str):
     system_prompt = (
         "你是一位專業的台灣與全球財經/科技股分析師,也是精準的資料結構化助手。"
@@ -860,6 +892,14 @@ def _analyze(cfg: CategoryConfig, title: str, content: str):
 
 任務:{cfg.task}
 
+【只根據內文作答,不要用你自己的既有知識補完】這點最重要:
+• **股票代號必須是【內文】裡實際出現過的數字**。內文沒寫代號就只寫公司名稱(例:「衛司特」),
+  **絕對不要憑印象填代號** —— 填錯代號會讓後續所有新聞、財報都掛到別家公司。
+• **概念/族群必須是內文明確描述的業務或題材**。不可以因為某個題材現在很熱門、或因為它出現在
+  下方標準清單裡,就套到這家公司身上;內文沒講的產品線、客戶、應用領域一律不要寫。
+• 內文沒提到的時程、數字、公司,一律留空,不要推測或補充。
+• 如果【內文】很短(例如只有標題),就只根據那幾句話寫,寧可摘要簡略、其他欄位留空。
+
 注意:處理時程(timelines)時,若新聞只寫月份/日期、沒寫年份,請以「今天日期」為基準推斷正確年份(通常是今年或最近的合理年份),不要預設成過去的年份。
 
 請「只」回傳符合下列結構的 JSON,沒有資料的欄位給空陣列或空字串;陣列內一律放純文字字串(不要包成物件):
@@ -870,8 +910,11 @@ def _analyze(cfg: CategoryConfig, title: str, content: str):
         whitelist = _get_concept_whitelist()
         if whitelist:
             user_prompt += (
-                "\n\n【概念/族群標準清單】抽取概念或族群標籤時,若意思與下列清單中的項目相同,"
-                "請『直接沿用清單裡的標準寫法』;只有清單真的找不到對應時,才自行命名(用業界慣用簡稱)。\n"
+                "\n\n【概念/族群標準清單】這份清單只是**統一命名用**,不是候選答案:"
+                "當你**已經從內文判斷出**某個概念、而清單裡有意思相同的項目時,沿用清單的標準寫法;"
+                "清單找不到對應才自行命名(用業界慣用簡稱)。"
+                "⚠️**不可以反過來從清單挑看起來熱門的題材套到這家公司身上** —— "
+                "內文沒有支持的概念一個都不要寫。\n"
                 + "、".join(whitelist)
             )
 
@@ -1029,9 +1072,13 @@ def route_and_store(text: str) -> Result:
         except FetchError as e:
             logger.warning("抓取全文失敗,退回使用者貼的文字:%s", e)
             # 若使用者只丟了連結、沒有可分析的內文 → 明確提示
-            if len(_URL_RE.sub("", content).strip()) < 12:
+            # ⚠️ 門檻不能只設「有沒有字」:抓不到內文時,使用者順手貼的**標題**(通常 20~30 字)
+            #    會被當成內文送進 AI,而 AI 在資訊不足時會用既有知識補完 —— 摘要、族群、
+            #    甚至股票代號都可能是編的(2026-08 踩過)。標題長度撐不起一篇分析,要擋掉。
+            if len(_URL_RE.sub("", content).strip()) < 60:
                 raise NoCategoryError(
-                    "⚠️ 這個連結抓不到內文(可能需要登入或被網站擋爬蟲)。\n"
+                    "⚠️ 這個連結抓不到內文(可能需要登入或被網站擋爬蟲),\n"
+                    "而你貼的文字太短、只夠當標題 —— 這種情況硬分析會編出錯的內容。\n"
                     "請直接複製新聞內文貼上,我就能幫你整理。"
                 ) from e
 
@@ -1046,6 +1093,16 @@ def route_and_store(text: str) -> Result:
     content = content[:MAX_CONTENT_CHARS]
     title = fetched_title or _extract_title(content)
     analysis = _analyze(cfg, title, content)
+    # 代號硬驗證:AI 認得公司名卻不知道代號時會憑印象填,而錯的代號會讓這檔往後的
+    # 新聞/財報/EPS 全掛到別家公司。原文沒出現過的代號一律拿掉,只留公司名。
+    code_warn = ""
+    if getattr(analysis, "mentioned_stocks", None):
+        analysis.mentioned_stocks, dropped = verify_stock_codes(
+            analysis.mentioned_stocks, f"{title}\n{content}")
+        if dropped:
+            logger.warning("代號未出現在原文,已移除:%s", dropped)
+            code_warn = ("\n\n⚠️ 這幾個代號沒出現在原文、可能是 AI 填錯,已只留公司名:"
+                         + "、".join(dropped) + "\n(要補正確代號請用「主表 加股 <代號 名稱>」)")
     now = _now_str()
 
     # 寫進 Notion(取代 Google Sheet);概念自動找/建並掛到個股
@@ -1058,6 +1115,8 @@ def route_and_store(text: str) -> Result:
     reply = cfg.format_reply(analysis)
     if addendum:
         reply = f"{reply}\n\n{addendum}"
+    if code_warn:
+        reply += code_warn
     return Result(label=cfg.label, reply=reply)
 
 
