@@ -154,6 +154,17 @@ def _reply_eps(reply_token: str, user_id: str, text: str) -> None:
         _say(reply_token, user_id, reply)
 
 
+# ---- 背景執行「族群」查詢(概念成員)並回覆 ----
+def _reply_concept(reply_token: str, user_id: str, text: str) -> None:
+    try:
+        reply = calendar_notify.run_concept_query(text)
+    except Exception as e:  # noqa: BLE001
+        logger.exception("族群查詢失敗")
+        reply = f"❌ 族群查詢失敗:{e}"
+    if reply:
+        _say(reply_token, user_id, reply)
+
+
 # ---- 背景執行「提醒」設定/查詢並回覆 ----
 def _reply_alert(reply_token: str, user_id: str, text: str) -> None:
     try:
@@ -208,7 +219,7 @@ def _reply_alerts_query(reply_token: str, user_id: str, text: str) -> None:
 
 
 # ---- 健康檢查(打開網址會看到 OK,確認服務有在跑)----
-APP_VERSION = "2026-08-22-multievent"  # 每次改版更新,方便用網址確認線上是否為新版
+APP_VERSION = "2026-08-22-scope"  # 每次改版更新,方便用網址確認線上是否為新版
 
 
 @app.get("/")
@@ -330,6 +341,15 @@ def callback():
                 continue
             threading.Thread(
                 target=_reply_eps,
+                args=(reply_token, user_id, text),
+                daemon=True,
+            ).start()
+            continue
+
+        # 「族群」列出所有概念與檔數;「族群 半導體檢測」列成員:唯讀,群組與私訊都可用
+        if calendar_notify.is_concept_command(text):
+            threading.Thread(
+                target=_reply_concept,
                 args=(reply_token, user_id, text),
                 daemon=True,
             ).start()

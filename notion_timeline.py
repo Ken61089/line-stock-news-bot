@@ -794,7 +794,8 @@ def add_knowledge(topic, key_points_text="", keywords=None, link="", source="新
 # 反向查詢用:讀近期頁、把頁面屬性攤平成文字
 # ==========================================================
 def list_concepts() -> list:
-    """列出概念族群庫所有概念,回傳 [{'id','name'}](自動翻頁)。"""
+    """列出概念族群庫所有概念,回傳 [{'id','name','members'}](自動翻頁)。
+    members 直接取查詢結果裡的 relation 長度 —— 免費,不必再逐頁查成員。"""
     results, cursor = [], None
     while True:
         payload = {"page_size": 100}
@@ -802,9 +803,11 @@ def list_concepts() -> list:
             payload["start_cursor"] = cursor
         data = _post(f"/data_sources/{CONCEPT_DS}/query", payload)
         for page in data.get("results", []):
-            title = page.get("properties", {}).get("Name", {}).get("title", [])
+            props = page.get("properties", {})
+            title = props.get("Name", {}).get("title", [])
             name = "".join(t.get("plain_text", "") for t in title).strip()
-            results.append({"id": page["id"], "name": name})
+            members = len(props.get("🔗 成員個股", {}).get("relation", []))
+            results.append({"id": page["id"], "name": name, "members": members})
         if not data.get("has_more"):
             break
         cursor = data.get("next_cursor")

@@ -93,10 +93,28 @@ def query_events(start: datetime.date, end: datetime.date,
             "status": status,
             # 這筆事件自己指定的提前預告天數(展覽/漲價這類要提前佈局的才會有)
             "lead": p.get("提前提醒", {}).get("number") or 0,
-            "stocks": len(p.get("🔗 關聯個股", {}).get("relation", [])),
-            "concepts": len(p.get("🔗 概念族群", {}).get("relation", [])),
+            "stock_ids": [r["id"] for r in p.get("🔗 關聯個股", {}).get("relation", []) if r.get("id")],
+            "concept_ids": [r["id"] for r in p.get("🔗 概念族群", {}).get("relation", []) if r.get("id")],
         })
+    for e in events:
+        e["stocks"], e["concepts"] = len(e["stock_ids"]), len(e["concept_ids"])
     return events
+
+
+def label_map() -> dict:
+    """relation id → 顯示名稱(個股「2330 台積電」/概念「#CPO」)。
+    ⚠️ Notion 的 relation 只給 id,要名稱得逐筆查頁面 —— 一個 8 檔的族群事件就是 8 次 API。
+    改成一次撈完主表與概念庫建 map(各 1~2 次分頁查詢),之後查表零成本。"""
+    m = {}
+    try:
+        for s in nt.list_stocks():
+            m[s["id"]] = s["label"]
+        for c in nt.list_concepts():
+            n = c.get("members") or 0
+            m[c["id"]] = "#" + (c.get("name") or "") + (f"({n}檔)" if n else "")
+    except nt.NotionError as e:
+        logger.warning("建立名稱對照表失敗:%s", e)
+    return m
 
 
 # ---- 格式化訊息 ----
@@ -127,9 +145,33 @@ def format_daily(events: list[dict], day: datetime.date,
     return f"{head}\n\n{body}"
 
 
-def format_earnings_preview(events: list[dict], today: datetime.date) -> str:
+_SCOPE_INLINE_MAX = 4  # 標的少於等於這個數就整串列出,再多只列前 3 檔
+
+
+def _scope_text(ev: dict, names: dict) -> str:
+    """把事件涵蓋的標的整理成一行。單檔事件不標(那是它自己),多標的才需要知道範圍。"""
+    s_ids, c_ids = ev.get("stock_ids") or [], ev.get("concept_ids") or []
+    # ⚠️ 單檔事件的「概念族群」是該股自動歸類來的(台積電法說會會帶 8 個概念),
+    # 那不是事件的影響範圍,標出來只會誤導。
+    if len(s_ids) <= 1 and not (len(s_ids) == 0 and c_ids):
+        return ""
+    parts = []
+    if c_ids:
+        parts += [names.get(i, "#?") for i in c_ids]
+    if s_ids:
+        labels = [names.get(i, "?") for i in s_ids]
+        if len(labels) <= _SCOPE_INLINE_MAX:
+            parts += labels
+        else:
+            parts += labels[:3] + [f"等 {len(labels)} 檔"]
+    return "\n   ↳ " + "、".join(parts) if parts else ""
+
+
+def format_earnings_preview(events: list[dict], today: datetime.date,
+                            names: dict | None = None) -> str:
     """提前預告區塊,依日期排序、標倒數天數。
     涵蓋法說會/財報公布(全域天數)與任何自訂了「提前提醒」的事件(如展覽、漲價)。"""
+    names = names if names is not None else {}
     lines = []
     for ev in sorted(events, key=lambda e: e["start"]):
         try:
@@ -140,16 +182,8 @@ def format_earnings_preview(events: list[dict], today: datetime.date) -> str:
         when = "今天" if days == 0 else f"還有{days}天"
         w = _WEEKDAY_ZH[dd.weekday()]
         emoji = TYPE_EMOJI.get(ev["type"], "🎤")
-        # 影響多檔/整個族群的事件,標出涵蓋範圍才知道要看多廣。
-        # ⚠️ 單檔事件的「概念族群」是該股自動歸類來的(台積電法說會會帶 8 個概念),
-        # 那不是事件的影響範圍,標出來只會誤導 —— 所以只有真正的多標的事件才顯示。
-        scope = ""
-        n_s, n_c = ev.get("stocks") or 0, ev.get("concepts") or 0
-        if n_s > 1:
-            scope = f" — {n_s} 檔" + (f"/{n_c} 族群" if n_c else "")
-        elif n_s == 0 and n_c:
-            scope = f" — {n_c} 個族群"
-        lines.append(f"{emoji} {dd.month}/{dd.day}(週{w}・{when}) {ev['title']}{scope}")
+        lines.append(f"{emoji} {dd.month}/{dd.day}(週{w}・{when}) {ev['title']}"
+                     + _scope_text(ev, names))
     return "📢 近期預告\n" + "\n".join(lines)
 
 
@@ -531,6 +565,40 @@ def is_stock_info_command(text: str) -> bool:
     return t.startswith("股訊 ") or t == "股訊"
 
 
+# ---- 「族群」查概念成員(唯讀 reply,不計額度)----
+def is_concept_command(text: str) -> bool:
+    t = (text or "").strip()
+    first = t.splitlines()[0].strip() if t else ""
+    return first == "族群" or first.startswith("族群 ")
+
+
+def run_concept_query(text: str) -> str:
+    """「族群」→ 列出所有概念與檔數;「族群 半導體檢測」→ 列出該族群成員。
+    早報的族群事件只標 #名稱(N檔),要看是哪幾檔就用這個。"""
+    arg = (text or "").strip().splitlines()[0].strip()[len("族群"):].strip()
+    concepts = nt.list_concepts()
+    if not arg:
+        got = sorted([c for c in concepts if c.get("members")],
+                     key=lambda c: -(c.get("members") or 0))
+        if not got:
+            return "概念族群庫目前是空的。"
+        lines = [f"🏷️ 概念族群({len(got)} 個有成員)"]
+        lines += [f"{c['name']}({c['members']}檔)" for c in got[:40]]
+        lines.append("\n看成員:族群 <名稱>,例:族群 半導體檢測")
+        return "\n".join(lines)
+
+    hit = next((c for c in concepts if c["name"] == arg), None) \
+        or next((c for c in concepts if arg in c["name"]), None)
+    if not hit:
+        return f"找不到族群「{arg}」。打「族群」看目前有哪些。"
+    ids = nt.concept_member_ids(hit["id"])
+    if not ids:
+        return f"🏷️ {hit['name']}:目前沒有成員個股。"
+    labels = {s["id"]: s["label"] for s in nt.list_stocks()}
+    members = sorted(labels.get(i, "(未知)") for i in ids)
+    return f"🏷️ {hit['name']}({len(members)} 檔)\n" + "\n".join(members)
+
+
 def _stockinfo_group(event_type: str) -> str:
     if event_type in _STOCKINFO_NEWS:
         return "news"
@@ -644,7 +712,11 @@ def notify_daily(dry_run: bool = False) -> str | None:
 
     parts = [format_daily(events, today)]
     if preview:
-        parts.append(format_earnings_preview(preview, today))
+        # 只有真的有多標的事件時才去建名稱對照表(多兩次查詢,單檔法說會不必花)
+        needs_names = any(len(e.get("stock_ids") or []) > 1 or
+                          (not e.get("stock_ids") and e.get("concept_ids")) for e in preview)
+        parts.append(format_earnings_preview(preview, today,
+                                             label_map() if needs_names else {}))
     msg = "\n\n".join(parts)
     if dry_run:
         return msg
