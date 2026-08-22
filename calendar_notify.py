@@ -91,6 +91,10 @@ def query_events(start: datetime.date, end: datetime.date,
             "title": title or "(未命名事件)",
             "url": p.get("來源連結", {}).get("url") or "",
             "status": status,
+            # 這筆事件自己指定的提前預告天數(展覽/漲價這類要提前佈局的才會有)
+            "lead": p.get("提前提醒", {}).get("number") or 0,
+            "stocks": len(p.get("🔗 關聯個股", {}).get("relation", [])),
+            "concepts": len(p.get("🔗 概念族群", {}).get("relation", [])),
         })
     return events
 
@@ -124,7 +128,8 @@ def format_daily(events: list[dict], day: datetime.date,
 
 
 def format_earnings_preview(events: list[dict], today: datetime.date) -> str:
-    """提前預告區塊(法說會/財報公布),依日期排序,標倒數天數。"""
+    """提前預告區塊,依日期排序、標倒數天數。
+    涵蓋法說會/財報公布(全域天數)與任何自訂了「提前提醒」的事件(如展覽、漲價)。"""
     lines = []
     for ev in sorted(events, key=lambda e: e["start"]):
         try:
@@ -135,8 +140,17 @@ def format_earnings_preview(events: list[dict], today: datetime.date) -> str:
         when = "今天" if days == 0 else f"還有{days}天"
         w = _WEEKDAY_ZH[dd.weekday()]
         emoji = TYPE_EMOJI.get(ev["type"], "🎤")
-        lines.append(f"{emoji} {dd.month}/{dd.day}(週{w}・{when}) {ev['title']}")
-    return "📢 近期預告(法說會/財報)\n" + "\n".join(lines)
+        # 影響多檔/整個族群的事件,標出涵蓋範圍才知道要看多廣。
+        # ⚠️ 單檔事件的「概念族群」是該股自動歸類來的(台積電法說會會帶 8 個概念),
+        # 那不是事件的影響範圍,標出來只會誤導 —— 所以只有真正的多標的事件才顯示。
+        scope = ""
+        n_s, n_c = ev.get("stocks") or 0, ev.get("concepts") or 0
+        if n_s > 1:
+            scope = f" — {n_s} 檔" + (f"/{n_c} 族群" if n_c else "")
+        elif n_s == 0 and n_c:
+            scope = f" — {n_c} 個族群"
+        lines.append(f"{emoji} {dd.month}/{dd.day}(週{w}・{when}) {ev['title']}{scope}")
+    return "📢 近期預告\n" + "\n".join(lines)
 
 
 # ---- 隨選「列出事件」:本週/下週/指定日期或範圍 ----
@@ -465,6 +479,36 @@ EARNINGS_LEAD_DAYS = int(os.environ.get("EARNINGS_LEAD_DAYS", "2"))
 _PREVIEW_TYPES = {"法說會", "財報公布"}
 
 
+# 事件自訂提前天數的上限:再遠就先不提醒(免得早報被三個月後的展覽塞滿)
+MAX_LEAD_DAYS = int(os.environ.get("MAX_LEAD_DAYS", "30"))
+
+
+def collect_preview(today: datetime.date) -> list[dict]:
+    """收集「該提前預告」的未來事件,回傳已排序的清單。兩種來源:
+      ① 法說會/財報公布 —— 沿用全域的 EARNINGS_LEAD_DAYS(每檔都一樣)
+      ② 任何有填「提前提醒」天數的事件 —— 用它自己的天數
+    ⚠️ 每筆事件需要的前置時間差很多(展覽要一週佈局、除權息前三天知道就夠),
+    所以逐筆指定優先於全域值。"""
+    horizon = max(EARNINGS_LEAD_DAYS, MAX_LEAD_DAYS)
+    if horizon <= 0:
+        return []
+    ahead = query_events(today + datetime.timedelta(days=1),
+                         today + datetime.timedelta(days=horizon))
+    out = []
+    for e in ahead:
+        try:
+            days = (datetime.date.fromisoformat(e["start"]) - today).days
+        except (ValueError, TypeError):
+            continue
+        lead = int(e.get("lead") or 0)
+        if lead > 0:
+            if days <= min(lead, MAX_LEAD_DAYS):
+                out.append(e)
+        elif e["type"] in _PREVIEW_TYPES and days <= EARNINGS_LEAD_DAYS:
+            out.append(e)
+    return sorted(out, key=lambda x: x["start"])
+
+
 def format_notes(notes: list[dict], day: datetime.date) -> str:
     """今日隨筆彙整區塊(依時間排序,標記錄時間)。"""
     head = f"📝 今日隨筆彙整 {day.month}/{day.day}"
@@ -592,12 +636,7 @@ def notify_daily(dry_run: bool = False) -> str | None:
     # 隨手筆記只在 21:00 彙整、重大訊息只在「查重訊」看,都不在早上出現
     events = query_events(today, today, extra_exclude={"隨手筆記", "重大訊息"})
 
-    # 法說會提前預告:未來 1~EARNINGS_LEAD_DAYS 天內的法說會(僅預告類型)
-    preview = []
-    if EARNINGS_LEAD_DAYS > 0:
-        ahead = query_events(today + datetime.timedelta(days=1),
-                             today + datetime.timedelta(days=EARNINGS_LEAD_DAYS))
-        preview = [e for e in ahead if e["type"] in _PREVIEW_TYPES]
+    preview = collect_preview(today)
 
     if not events and not preview:
         logger.info("今日(%s)無事件、近日無法說會,不推播。", today)

@@ -731,6 +731,9 @@ _HELP_TEXT = (
     "• 時程 2330 7/17 法說會\n"
     "• 時程 3583 擴廠 8月試產、11月量產\n"
     "• 批次:第一行只打「時程」,之後一行一筆\n"
+    "• 一個事件連帶多檔:時程 2330,2454,3324 9/15 台北自動化展\n"
+    "• 掛整個族群:時程 #CPO 9/15 OFC展覽(成員自動涵蓋)\n"
+    "• 提前提醒:句尾加「提前7天」→ 前 7 天起每天早報預告\n"
     "\n"
     "━━ 隔日盯盤 ━━(「關注」開頭,隔天 08:30 隨推播通知)\n"
     "• 關注 2330 台積電 站上季線再追\n"
@@ -1168,10 +1171,19 @@ _TIMELINE_USAGE = (
     "• 時程 6442光聖 Q3 台北國際光電展\n"
     "• 時程 3583 擴廠 8月試產、11月量產\n"
     "\n"
-    "批次(一次多檔):第一行只打「時程」,之後一行一筆:\n"
+    "批次(一次多筆):第一行只打「時程」,之後一行一筆:\n"
     "時程\n"
     "2330 台積電 法說會 7/16\n"
-    "3008 大立光 法說會 7/9"
+    "3008 大立光 法說會 7/9\n"
+    "\n"
+    "🎯 一個事件連帶多檔(展覽、漲價這類):\n"
+    "• 時程 2330,2454,3324 9/15 台北自動化展\n"
+    "• 時程 #CPO 9/15 OFC展覽 ← 掛族群,成員自動涵蓋(日後新增的成員也算)\n"
+    "• 時程 #CPO,#矽光子 9/15 OFC展覽\n"
+    "\n"
+    "⏰ 提前提醒(展覽要提早佈局時很好用):句尾加「提前7天」\n"
+    "• 時程 #CPO 9/15 OFC展覽 提前7天\n"
+    "  → 事件前 7 天起,每天 08:30 早報的「近期預告」都會帶到(不另外推播、不吃額度)"
 )
 
 
@@ -1268,7 +1280,80 @@ class _TimelineItemError(Exception):
     """單一筆時程解析/寫入的可回復錯誤(批次時記下該行、其餘照寫)。"""
 
 
-def _store_timeline_event(data: TimelineInput, body: str) -> dict:
+# 一個事件連帶多檔/整個族群時用的標記,在送 AI 之前先由程式抽掉(比讓 AI 猜可靠):
+#   時程 2330,2454,3324 9/15 台北自動化展 提前7天
+#   時程 #CPO,#矽光子 9/15 OFC展覽 提前7天
+_MULTI_CODES_RE = re.compile(r"(?<![\d])(\d{4,6}(?:\s*[,，、]\s*\d{4,6})+)(?![\d])")
+_CONCEPT_TAG_RE = re.compile(r"[#＃]\s*([^\s,，、#＃]{2,20})")
+_LEAD_RE = re.compile(r"提前\s*(\d{1,3})\s*[天日]?")
+
+
+def extract_event_targets(body: str) -> tuple:
+    """從一行時程指令抽出「多檔代號 / 概念標籤 / 提前天數」,回 (codes, concepts, lead, 剩餘文字)。
+    抽掉這些標記再交給 AI 解析日期與標題 —— 標記格式明確,程式抽比讓 AI 猜穩定得多。"""
+    codes, concepts, lead = [], [], 0
+    rest = body
+
+    m = _LEAD_RE.search(rest)
+    if m:
+        lead = int(m.group(1))
+        rest = rest.replace(m.group(0), " ", 1)
+
+    for m in _CONCEPT_TAG_RE.finditer(rest):
+        concepts.append(m.group(1).strip())
+    if concepts:
+        rest = _CONCEPT_TAG_RE.sub(" ", rest)
+
+    m = _MULTI_CODES_RE.search(rest)
+    if m:
+        codes = [c.strip() for c in re.split(r"[,，、]", m.group(1)) if c.strip()]
+        rest = rest.replace(m.group(1), " ", 1)
+
+    rest = re.sub(r"\s{2,}", " ", rest).strip()
+    rest = re.sub(r"^[\s,，、]+", "", rest)  # 標記移除後可能留下開頭的逗號
+    return codes, concepts, lead, rest
+
+
+def _resolve_multi_targets(codes: list, concepts: list) -> tuple:
+    """把代號清單與概念名稱轉成 Notion page id。回 (stock_ids, concept_ids, labels, warns)。
+    代號查不到就自動建檔(比照時程指令既有行為);概念查不到會新建。"""
+    stock_ids, concept_ids, labels, warns = [], [], [], []
+    for code in codes:
+        try:
+            sp = notion_timeline.find_stock_page(code, "")
+            if sp is None and os.environ.get("AUTO_CREATE_STOCK", "1") != "0" \
+                    and not _is_non_stock_code(code):
+                # 只有代號的個股頁日後看不出是哪家,先用即時報價把公司名補上(免費、一次請求)
+                name = ""
+                try:
+                    import price_alerts
+                    q = price_alerts.fetch_quotes([(code, price_alerts.resolve_market(code))])
+                    name = (q.get(code) or {}).get("name", "")
+                except Exception as e:  # noqa: BLE001
+                    logger.info("查代號 %s 的公司名失敗:%s", code, e)
+                sp = notion_timeline.create_stock_page(code, name)
+                warns.append(f"🆕 已自動新增個股「{sp['label']}」")
+            if sp:
+                stock_ids.append(sp["id"])
+                labels.append(sp["label"])
+            else:
+                warns.append(f"⚠️ 找不到「{code}」,未關聯")
+        except notion_timeline.NotionError as e:
+            logger.warning("解析多檔個股失敗(%s):%s", code, e)
+            warns.append(f"⚠️「{code}」關聯失敗")
+    for name in concepts:
+        try:
+            cid = notion_timeline.find_or_create_concept(name)
+            concept_ids.append(cid)
+            n = len(notion_timeline.concept_member_ids(cid))
+            labels.append(f"#{name}({n}檔)")
+        except notion_timeline.NotionError as e:
+            logger.warning("解析概念失敗(%s):%s", name, e)
+            warns.append(f"⚠️ 概念「{name}」關聯失敗")
+    return stock_ids, concept_ids, labels, warns
+
+
+def _store_timeline_event(data: TimelineInput, body: str, targets: tuple | None = None) -> dict:
     """寫入一筆時程事件到 Notion。成功回傳含摘要欄位的 dict;
     可回復錯誤(看不出日期)丟 _TimelineItemError,由呼叫端決定要略過或回提示。"""
     if not data.title:
@@ -1277,6 +1362,13 @@ def _store_timeline_event(data: TimelineInput, body: str) -> dict:
         raise _TimelineItemError(
             f"看不出「{body}」裡的日期(請補上「8月量產」「7/17 法說會」「Q3」之類)"
         )
+
+    # 一個事件連帶多檔/整個族群(展覽、漲價…)。targets 由呼叫端在**送 AI 之前**抽好傳進來,
+    # 這樣 AI 看到的是去掉標記的乾淨文字,不會把「提前7天」當成備註內容。
+    multi_codes, multi_concepts, lead_days = (targets or extract_event_targets(body))[:3]
+    multi_stock_ids, multi_concept_ids, multi_labels, multi_warns = (
+        _resolve_multi_targets(multi_codes, multi_concepts) if (multi_codes or multi_concepts)
+        else ([], [], [], []))
 
     # 找個股頁(用代號優先);找不到就自動新增到個股主表再關聯
     stock = None
@@ -1323,16 +1415,35 @@ def _store_timeline_event(data: TimelineInput, body: str) -> dict:
     )
     event_title = data.title if (has_company or not company) else f"{company} {data.title}".strip()
 
+    # 多檔事件的標題不該硬掛某一家的名字(那是單檔流程的行為)
+    if multi_stock_ids or multi_concept_ids:
+        event_title = data.title
+
+    # ⚠️ 多檔/族群事件**不要**繼承某一檔的概念:單檔流程會把該股的全部概念掛上去,
+    # 但「台北自動化展」關聯了三檔時,掛上其中台積電的 8 個概念只是污染。
+    if multi_stock_ids or multi_concept_ids:
+        concept_ids = list(multi_concept_ids)
+    else:
+        concept_ids = list(stock.get("concept_ids") or []) if stock else []
+
     result = notion_timeline.add_event(
         title=event_title,
         date_start=data.date_start,
         date_end=data.date_end,
         event_type=data.event_type,
         stock_page_id=stock["id"] if stock else "",
-        concept_ids=stock.get("concept_ids") if stock else None,
+        stock_page_ids=multi_stock_ids,
+        concept_ids=concept_ids or None,
         note=data.note,
         source="LINE",
+        lead_days=lead_days,
     )
+    if multi_labels:
+        warn += "\n🎯 涵蓋:" + "、".join(multi_labels[:12])
+    if multi_warns:
+        warn += "\n" + "\n".join(multi_warns[:5])
+    if lead_days:
+        warn += f"\n⏰ 事件前 {lead_days} 天起,每天早報會提醒你"
 
     date_txt = data.date_start + (f" ~ {data.date_end}" if data.date_end else "")
     return {
@@ -1340,6 +1451,7 @@ def _store_timeline_event(data: TimelineInput, body: str) -> dict:
         "date_txt": date_txt,
         "event_type": data.event_type or "其他",
         "stock": stock,
+        "multi": len(multi_stock_ids) + len(multi_concept_ids),
         "note": data.note,
         "warn": warn,
         "auto_created": auto_created,
@@ -1382,18 +1494,25 @@ def _handle_timeline(text: str):
             "(Notion integration 密鑰,並把「股票投資大腦」頁面分享給該 integration)。"
         )
 
-    parsed = _parse_timeline_many(bodies)
+    # 先把多檔/概念/提前天數的標記抽掉,再送 AI 解析日期與標題 ——
+    # 否則 AI 會把「提前7天」「#CPO」當成事件內容寫進標題或備註。
+    targets = [extract_event_targets(b) for b in bodies]
+    parsed = _parse_timeline_many([t[3] or b for t, b in zip(targets, bodies)])
 
     # ---- 單筆:維持原本詳細回覆 ----
     if len(bodies) == 1:
         try:
-            r = _store_timeline_event(parsed[0], bodies[0])
+            r = _store_timeline_event(parsed[0], bodies[0], targets[0])
         except _TimelineItemError as e:
             raise NoCategoryError(f"🗓️ {e}")
         stock = r["stock"]
-        linked = f"🔗 {stock['label']}" if stock else "(未關聯個股)"
-        n_concept = len(stock.get("concept_ids") or []) if stock else 0
-        concept_txt = f"（已自動歸類 {n_concept} 個概念）" if n_concept else ""
+        if r.get("multi"):
+            # 多檔/族群事件:標的列在下方「🎯 涵蓋」那行,這裡只報數量,免得寫成「未關聯個股」
+            linked, concept_txt = f"🔗 {r['multi']} 個標的", ""
+        else:
+            linked = f"🔗 {stock['label']}" if stock else "(未關聯個股)"
+            n_concept = len(stock.get("concept_ids") or []) if stock else 0
+            concept_txt = f"（已自動歸類 {n_concept} 個概念）" if n_concept else ""
         reply = (
             "🗓️ 已寫入 Notion 時間軸\n"
             f"• 事件:{r['event_title']}\n"
@@ -1409,9 +1528,9 @@ def _handle_timeline(text: str):
 
     # ---- 批次:每行一筆,逐筆寫入,回覆彙整(單筆失敗不影響其他筆) ----
     ok_lines, fail_lines = [], []
-    for data, body in zip(parsed, bodies):
+    for data, body, tg in zip(parsed, bodies, targets):
         try:
-            r = _store_timeline_event(data, body)
+            r = _store_timeline_event(data, body, tg)
         except _TimelineItemError as e:
             fail_lines.append(f"⚠️ {body} — {e}")
             continue

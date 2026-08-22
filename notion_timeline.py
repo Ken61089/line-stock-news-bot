@@ -608,9 +608,11 @@ def add_event(
     status: str = "",
     link: str = "",
     stock_page_ids: list | None = None,
+    lead_days: int | None = None,
 ) -> dict:
     """建立一筆時程事件頁,回傳 {'url'}。link 會寫進「來源連結」。
-    stock_page_id(單檔,向下相容)與 stock_page_ids(多檔)可並用,內部合併去重。"""
+    stock_page_id(單檔,向下相容)與 stock_page_ids(多檔)可並用,內部合併去重。
+    lead_days:提前幾天在早報預告(展覽/漲價這類要提前佈局的事件用;不填就不預告)。"""
     if event_type not in EVENT_TYPES:
         event_type = "其他"
     if not status:
@@ -636,6 +638,8 @@ def add_event(
         props["🔗 概念族群"] = {"relation": [{"id": cid} for cid in _dedup(concept_ids)]}
     if link:
         props["來源連結"] = {"url": link}
+    if lead_days:
+        props["提前提醒"] = {"number": int(lead_days)}
 
     data = _post(
         "/pages",
