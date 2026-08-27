@@ -743,10 +743,17 @@ def is_month_digest_day(today: datetime.date) -> bool:
 
 
 def collect_watch_span(today: datetime.date, rows: list[dict] | None = None) -> list[dict]:
-    """區間事件(季/半年/年/跨年),取跟「本月~下月底」有重疊的。"""
+    """區間事件(季/半年/年/跨年),只取「本月開始」或「本月結束」的。
+
+    ⚠️ 不要用「與本月~下月底有交集」——那會讓 2026Q4 在 9/10/11/12 月的彙整各洗一遍
+    (實測 4 個彙整日共 56 件次、10 筆各出現 4 次、12/1 那次爆到 24 件)。
+    改成只在區間的頭尾提醒:
+      開始 → 這一段剛開始,要盯這些
+      驗收 → 這一段快結束了,去檢查有沒有兌現(區間事件原本缺的就是這個)
+    同一筆最多出現 2 次,總量降到 19 件次。
+    代價:開始月與結束月之間不會出現——那幾個月它就是「進行中」,提醒也沒有動作可做。"""
     lo = today.replace(day=1)
-    nxt = (lo + datetime.timedelta(days=32)).replace(day=1)
-    hi = (nxt + datetime.timedelta(days=32)).replace(day=1) - datetime.timedelta(days=1)
+    hi = (lo + datetime.timedelta(days=32)).replace(day=1) - datetime.timedelta(days=1)
     out = []
     for w in (rows if rows is not None else _watch_rows()):
         for e in w["events"]:
@@ -757,9 +764,15 @@ def collect_watch_span(today: datetime.date, rows: list[dict] | None = None) -> 
                 d2 = datetime.date.fromisoformat(e["dateEnd"])
             except ValueError:
                 continue
-            if d1 <= hi and d2 >= lo:          # 與窗口有交集
-                out.append({**e, "code": w["code"], "name": w["name"], "d": d1})
-    return sorted(out, key=lambda x: x["d"])
+            if lo <= d1 <= hi:
+                tag = "開始"
+            elif lo <= d2 <= hi:
+                tag = "驗收"
+            else:
+                continue
+            out.append({**e, "code": w["code"], "name": w["name"], "d": d1, "tag": tag})
+    # 驗收排前面:那是有時效的(這個月不看就過期了),開始的比較不急
+    return sorted(out, key=lambda x: (x["tag"] != "驗收", x["d"]))
 
 
 def format_watch_preview(items: list[dict]) -> str:
@@ -773,11 +786,17 @@ def format_watch_preview(items: list[dict]) -> str:
 
 
 def format_watch_span(items: list[dict], today: datetime.date) -> str:
+    """驗收用 ✅、開始用 ▶️,讓「該去查了」跟「才剛開始」一眼分得出來。"""
+    n_chk = sum(1 for e in items if e["tag"] == "驗收")
     lines = []
     for e in items:
-        lines.append(f"・{e['short']} {e['name']} {e['code']}:{e['text'][:52]}")
-    return (f"🗓️ 本月及下月要盯的({today.month}月起・{len(items)} 件)\n" + "\n".join(lines)
-            + "\n\n(季/年這種區間事件每月初列一次,精確日期的會另外提前提醒)")
+        mark = "✅" if e["tag"] == "驗收" else "▶️"
+        lines.append(f"{mark} [{e['tag']}] {e['short']} {e['name']} {e['code']}\n"
+                     f"   ↳ {e['text'][:56]}")
+    head = f"🗓️ {today.month}月的區間觀察・{len(items)} 件"
+    tail = ("\n\n✅=這一段快結束了,去檢查有沒有兌現;▶️=這一段剛開始"
+            if n_chk else "\n\n▶️=這一段剛開始要盯")
+    return head + "\n" + "\n".join(lines) + tail
 
 
 # ---- 排程任務 ----
