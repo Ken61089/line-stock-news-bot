@@ -698,6 +698,88 @@ def run_stock_info(text: str) -> str:
     return "\n".join(lines)
 
 
+# ---- CB tracker 觀察時間點 ----
+# 精確日期的事件進「近期預告」(依精度決定提前幾天);季/半年/年這種區間沒有具體某一天,
+# 每天推只會變雜訊 → 改成每月第一個工作日彙整一次「本月及下月要盯的」。
+_WATCH_LEAD = {"day": 7, "month": 14}   # 依精度自動,CB追蹤表沒有逐筆的提前提醒欄
+_WATCH_SPAN_PRECS = ("quarter", "half", "year", "range")
+
+
+def _watch_rows() -> list[dict]:
+    # ⚠️ 一定要在函式內 import:fetchers 反向 import 了 calendar_notify,
+    # 頂層 import 會造成循環 import。
+    try:
+        import fetchers
+        return fetchers.fetch_cb_watch()
+    except Exception as e:                    # 外部服務不該拖垮早報
+        logger.warning("觀察時間點讀取失敗:%s", e)
+        return []
+
+
+def collect_watch_preview(today: datetime.date, rows: list[dict] | None = None) -> list[dict]:
+    """精確到日/月的事件,進入提前窗就回傳(依精度給不同提前天數)。"""
+    out = []
+    for w in (rows if rows is not None else _watch_rows()):
+        for e in w["events"]:
+            lead = _WATCH_LEAD.get(e["prec"])
+            if not lead:
+                continue
+            try:
+                d = datetime.date.fromisoformat(e["date"])
+            except ValueError:
+                continue
+            days = (d - today).days
+            if 0 <= days <= lead:
+                out.append({**e, "code": w["code"], "name": w["name"], "days": days, "d": d})
+    return sorted(out, key=lambda x: x["d"])
+
+
+def is_month_digest_day(today: datetime.date) -> bool:
+    """本月第一個工作日?(1號逢週末就順延,免得彙整卡在沒人看的日子)"""
+    first = today.replace(day=1)
+    while first.weekday() >= 5:
+        first += datetime.timedelta(days=1)
+    return today == first
+
+
+def collect_watch_span(today: datetime.date, rows: list[dict] | None = None) -> list[dict]:
+    """區間事件(季/半年/年/跨年),取跟「本月~下月底」有重疊的。"""
+    lo = today.replace(day=1)
+    nxt = (lo + datetime.timedelta(days=32)).replace(day=1)
+    hi = (nxt + datetime.timedelta(days=32)).replace(day=1) - datetime.timedelta(days=1)
+    out = []
+    for w in (rows if rows is not None else _watch_rows()):
+        for e in w["events"]:
+            if e["prec"] not in _WATCH_SPAN_PRECS:
+                continue
+            try:
+                d1 = datetime.date.fromisoformat(e["date"])
+                d2 = datetime.date.fromisoformat(e["dateEnd"])
+            except ValueError:
+                continue
+            if d1 <= hi and d2 >= lo:          # 與窗口有交集
+                out.append({**e, "code": w["code"], "name": w["name"], "d": d1})
+    return sorted(out, key=lambda x: x["d"])
+
+
+def format_watch_preview(items: list[dict]) -> str:
+    lines = []
+    for e in items:
+        when = "今天" if e["days"] == 0 else f"還有{e['days']}天"
+        w = _WEEKDAY_ZH[e["d"].weekday()]
+        lines.append(f"📌 {e['d'].month}/{e['d'].day}(週{w}・{when}) {e['name']} {e['code']}"
+                     f"\n   ↳ {e['text'][:60]}")
+    return "🔭 觀察時間點\n" + "\n".join(lines)
+
+
+def format_watch_span(items: list[dict], today: datetime.date) -> str:
+    lines = []
+    for e in items:
+        lines.append(f"・{e['short']} {e['name']} {e['code']}:{e['text'][:52]}")
+    return (f"🗓️ 本月及下月要盯的({today.month}月起・{len(items)} 件)\n" + "\n".join(lines)
+            + "\n\n(季/年這種區間事件每月初列一次,精確日期的會另外提前提醒)")
+
+
 # ---- 排程任務 ----
 def notify_daily(dry_run: bool = False) -> str | None:
     today = datetime.datetime.now(TW_TZ).date()
@@ -706,8 +788,13 @@ def notify_daily(dry_run: bool = False) -> str | None:
 
     preview = collect_preview(today)
 
-    if not events and not preview:
-        logger.info("今日(%s)無事件、近日無法說會,不推播。", today)
+    # CB tracker 的觀察時間點:一次讀、兩種用途(精確日期預告 + 月初區間彙整)
+    wrows = _watch_rows()
+    wpreview = collect_watch_preview(today, wrows)
+    wspan = collect_watch_span(today, wrows) if is_month_digest_day(today) else []
+
+    if not events and not preview and not wpreview and not wspan:
+        logger.info("今日(%s)無事件、近日無法說會、無觀察時間點,不推播。", today)
         return None
 
     parts = [format_daily(events, today)]
@@ -717,6 +804,10 @@ def notify_daily(dry_run: bool = False) -> str | None:
                           (not e.get("stock_ids") and e.get("concept_ids")) for e in preview)
         parts.append(format_earnings_preview(preview, today,
                                              label_map() if needs_names else {}))
+    if wpreview:
+        parts.append(format_watch_preview(wpreview))
+    if wspan:
+        parts.append(format_watch_span(wspan, today))
     msg = "\n\n".join(parts)
     if dry_run:
         return msg

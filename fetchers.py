@@ -97,6 +97,41 @@ def _fetch_html(url: str, *, headers: dict | None = None, follow_redirects: bool
     raise last if last else RuntimeError(f"抓取失敗:{url}")
 
 
+# ── CB tracker 觀察時間點 ────────────────────────────────────────────
+# 標的與事件的正本在「CB追蹤表」Google Sheet,由 ken-cb.zeabur.app 解析成結構化事件
+# (每筆帶 ISO 起訖日期與精度)。早報直接讀 API,不把事件複製進 Notion:
+# 複製就要處理去重與「重跑研究整批換新」時的刪舊,直接讀則永遠是最新的。
+CB_TRACKER_URL = os.environ.get("CB_TRACKER_URL", "https://ken-cb.zeabur.app").rstrip("/")
+
+def fetch_cb_watch() -> list[dict]:
+    """讀 CB tracker 的追蹤標的(含解析好的觀察時間點事件)。
+    回 [{code, name, events:[{date, dateEnd, prec, short, text}]}];
+    抓不到就回空 list——早報少一區,不該因此整個排程失敗。"""
+    if not CB_TRACKER_URL:
+        return []
+    try:
+        data = _margin_json(CB_TRACKER_URL + "/api/data", headers={"User-Agent": "line-news-bot"})
+    except Exception as e:
+        logger.warning("CB tracker 讀取失敗,早報略過觀察時間點:%s", e)
+        return []
+    out = []
+    for w in (data or {}).get("watch", []) or []:
+        code, name = str(w.get("代碼", "")).strip(), str(w.get("名稱", "")).strip()
+        if not (code or name):
+            continue
+        evs = []
+        for e in w.get("events", []) or []:
+            d, de = (e.get("date") or "").strip(), (e.get("dateEnd") or "").strip()
+            if not d:
+                continue          # 舊版 API 沒有 ISO 日期就跳過,不猜
+            evs.append({"date": d, "dateEnd": de or d, "prec": (e.get("prec") or "").strip(),
+                        "short": (e.get("short") or e.get("raw") or "").strip(),
+                        "text": (e.get("text") or "").strip()})
+        if evs:
+            out.append({"code": code, "name": name, "events": evs})
+    return out
+
+
 def fetch_moneylink_rows() -> list[dict]:
     """抓 money-link 法說會表,回傳 [{date, code, name, time, place, message, link}]。"""
     r = _fetch_html(MONEY_LINK_URL)
