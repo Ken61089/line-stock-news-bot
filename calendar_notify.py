@@ -701,7 +701,11 @@ def run_stock_info(text: str) -> str:
 # ---- CB tracker 觀察時間點 ----
 # 精確日期的事件進「近期預告」(依精度決定提前幾天);季/半年/年這種區間沒有具體某一天,
 # 每天推只會變雜訊 → 改成每月第一個工作日彙整一次「本月及下月要盯的」。
-_WATCH_LEAD = {"day": 7, "month": 14}   # 依精度自動,CB追蹤表沒有逐筆的提前提醒欄
+# 只在這幾個「還有幾天」的節點提醒,不是進窗後天天推。
+# 原本用「0 <= days <= 7」全收,同一筆會連推 8 天(9/10 那筆從 9/3 唸到 9/10),
+# 實際體感是同一件事被唸八次。改成 7 天前預告、3 天前提醒、當天最後一次。
+# 月精度的代表日是當月 1 號、本來就不是確切某天,多給一個 14 天的早期預告。
+_WATCH_MARKS = {"day": (7, 3, 0), "month": (14, 7, 3, 0)}
 _WATCH_SPAN_PRECS = ("quarter", "half", "year", "range")
 
 
@@ -717,19 +721,19 @@ def _watch_rows() -> list[dict]:
 
 
 def collect_watch_preview(today: datetime.date, rows: list[dict] | None = None) -> list[dict]:
-    """精確到日/月的事件,進入提前窗就回傳(依精度給不同提前天數)。"""
+    """精確到日/月的事件,只在 _WATCH_MARKS 的節點提醒(不是進窗後天天推)。"""
     out = []
     for w in (rows if rows is not None else _watch_rows()):
         for e in w["events"]:
-            lead = _WATCH_LEAD.get(e["prec"])
-            if not lead:
+            marks = _WATCH_MARKS.get(e["prec"])
+            if not marks:
                 continue
             try:
                 d = datetime.date.fromisoformat(e["date"])
             except ValueError:
                 continue
             days = (d - today).days
-            if 0 <= days <= lead:
+            if days in marks:
                 out.append({**e, "code": w["code"], "name": w["name"], "days": days, "d": d})
     return sorted(out, key=lambda x: x["d"])
 
