@@ -16,7 +16,7 @@ import datetime
 from dataclasses import dataclass
 from typing import List, Type, Callable
 
-from openai import OpenAI
+import anthropic
 from pydantic import BaseModel, ValidationError, model_validator
 
 from web_fetch import fetch_article, FetchError
@@ -29,9 +29,11 @@ logger = logging.getLogger("line-news-bot.news")
 # ==========================================================
 # 設定
 # ==========================================================
-AI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://hnd1.aihub.zeabur.ai/v1")
-AI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-4-5")
+# AI:2026-09 起走 Anthropic 官方 API(Zeabur AI Hub 在 8/27 資安事件後停服)。金鑰放 ANTHROPIC_API_KEY。
+AI_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+AI_MODEL = os.environ.get("AI_MODEL", "claude-sonnet-5")
+# 思考深度:Sonnet 5 的 medium ≈ Sonnet 4.6 的 high,結構化抽取已足夠;品質不夠再調 high
+AI_EFFORT = os.environ.get("AI_EFFORT", "medium")
 
 # 送進 AI 分析的內文字數上限(抓到的全文可能很長)
 MAX_CONTENT_CHARS = int(os.environ.get("MAX_CONTENT_CHARS", "8000"))
@@ -72,24 +74,25 @@ TW_TZ = datetime.timezone(datetime.timedelta(hours=8))
 def _now_str() -> str:
     return datetime.datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M")
 
-_openai_client = None
+_ai_client = None
 
 
-def _get_ai_client() -> OpenAI:
-    global _openai_client
-    if _openai_client is None:
+def _get_ai_client() -> anthropic.Anthropic:
+    global _ai_client
+    if _ai_client is None:
         if not AI_API_KEY:
-            raise RuntimeError("尚未設定 OPENAI_API_KEY(Zeabur AI Hub 的金鑰)")
-        _openai_client = OpenAI(base_url=AI_BASE_URL, api_key=AI_API_KEY)
-    return _openai_client
+            raise RuntimeError("尚未設定 ANTHROPIC_API_KEY(Anthropic 官方 API 金鑰)")
+        # SDK 內建自動重試:連線錯誤、429、5xx 各退避重試 2 次
+        _ai_client = anthropic.Anthropic(api_key=AI_API_KEY, timeout=120.0)
+    return _ai_client
 
 
 # ---- AI token 自計量(持久化到 Notion,跨部署/跨月累計)----
 # 每次呼叫 AI 從回應的 usage 累加當月 token,write-through 寫回 Notion「AI 用量統計」庫
 # (一月一列)。開機時從 Notion 載回當月累計 → 部署重啟不歸零。Notion 掛了則退回純記憶體。
 # 單價(每百萬 token,美金),換模型用 AI_PRICE_IN/OUT env 覆寫(如 Haiku 記得改)。
-_AI_PRICE_IN = float(os.environ.get("AI_PRICE_IN", "3.0"))
-_AI_PRICE_OUT = float(os.environ.get("AI_PRICE_OUT", "15.0"))
+_AI_PRICE_IN = float(os.environ.get("AI_PRICE_IN", "2.0"))  # Sonnet 5 牌價 $2/百萬 token
+_AI_PRICE_OUT = float(os.environ.get("AI_PRICE_OUT", "10.0"))  # Sonnet 5 牌價 $10/百萬 token
 _ai_lock = threading.Lock()
 _ai_state = {"month": "", "calls": 0, "prompt": 0, "completion": 0, "page_id": None, "loaded": False}
 
@@ -121,22 +124,15 @@ def _ensure_month_loaded() -> None:
     _ai_state["loaded"] = True
 
 
-def _ai_chat(**kwargs):
-    """呼叫 AI Hub 並把 token 用量累加到當月、write-through 寫回 Notion。用法同 create。
-
-    ⚠️ 預設 `temperature=0`:這裡的用途全是**結構化資料抽取**(從新聞抽個股/概念/時程),
-    要的是同一篇文章每次都給同一個答案,不是創意。OpenAI 相容介面沒指定時預設 1.0,
-    等於讓模型每次都擲骰子 —— 2026-08 就出過一次:同一篇衛司特(6894)法說新聞被抽成
-    「6570」+ 石英元件/CPO 等原文完全沒有的題材,事後用同樣輸入重跑卻都正確。
-    呼叫端仍可自行覆寫。"""
-    kwargs.setdefault("temperature", 0)
-    completion = _get_ai_client().chat.completions.create(**kwargs)
+def _record_ai_usage(usage) -> None:
+    """把一次呼叫的 token 用量累加到當月、write-through 寫回 Notion(計量失敗絕不影響主流程)。
+    Anthropic 的 usage 把快取讀寫另外列出,三者都算輸入。"""
     try:
-        u = completion.usage
-        dp = int(getattr(u, "prompt_tokens", 0) or 0)
-        dc = int(getattr(u, "completion_tokens", 0) or 0)
+        dp = sum(int(getattr(usage, k, 0) or 0) for k in
+                 ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        dc = int(getattr(usage, "output_tokens", 0) or 0)
     except (AttributeError, TypeError, ValueError):
-        return completion
+        return
     with _ai_lock:
         _ensure_month_loaded()
         _ai_state["calls"] += 1
@@ -154,7 +150,54 @@ def _ai_chat(**kwargs):
                     _ai_state["page_id"] = pid
         except Exception as e:  # noqa: BLE001
             logger.warning("寫入 AI 用量(Notion)失敗:%s", e)
-    return completion
+
+
+def _supports_effort(model: str) -> bool:
+    """output_config.effort 只有 Sonnet 4.6 / Opus 4.5 以後支援;Haiku 4.5、Sonnet 4.5 送了會報錯。"""
+    return not model.startswith(("claude-haiku", "claude-sonnet-4-5", "claude-3"))
+
+
+def _ai_chat(system: str, user: str, max_tokens: int, output_model=None):
+    """呼叫 Claude(Anthropic 官方 API)。給 output_model(pydantic)就回驗證後的物件,否則回純文字。
+
+    2026-09 從 Zeabur AI Hub(OpenAI 相容介面)改走 Anthropic 官方 SDK:AI Hub 在 8/27 Zeabur
+    資安事件後停服,端點直接從 DNS 消失,機器人只會回「Connection error.」。
+
+    ⚠️ 抽取改用**結構化輸出**(output_config.format = json_schema):由 API 端強制回傳符合 schema
+    的 JSON,取代原本「temperature=0 + 自己剝 JSON」。起因:2026-08 同一篇衛司特(6894)法說新聞
+    被抽成「6570」+ 原文沒有的題材。Sonnet 5 起送 temperature/top_p/top_k 會 400,所以一律不送。
+    ⚠️ 不用 messages.parse:回應被截斷(max_tokens)或拒答時,parse 在解析那一步就直接丟 pydantic
+    例外,拿不到 stop_reason、也記不到用量(離線測試抓到的)。改成 create + 官方 transform_schema,
+    先檢查 stop_reason 再自己驗證。
+    ⚠️ Sonnet 5 預設開 adaptive thinking,思考 token 也算在 max_tokens 裡,呼叫端上限要留足。"""
+    model = AI_MODEL
+    kwargs = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    output_config = {}
+    if _supports_effort(model):
+        output_config["effort"] = AI_EFFORT
+    if output_model is not None:
+        output_config["format"] = {"type": "json_schema",
+                                   "schema": anthropic.transform_schema(output_model)}
+    if output_config:
+        kwargs["output_config"] = output_config
+    resp = _get_ai_client().messages.create(**kwargs)
+    _record_ai_usage(resp.usage)
+    if resp.stop_reason == "refusal":
+        raise RuntimeError("AI 拒絕處理這則內容(安全政策)")
+    if resp.stop_reason == "max_tokens":
+        raise RuntimeError(f"AI 回覆超過上限({max_tokens} tokens)被截斷")
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    if output_model is None:
+        return text
+    try:
+        return output_model.model_validate_json(text)
+    except ValidationError as e:
+        raise RuntimeError(f"AI 回傳內容對不上資料格式:{e.errors()[:2]}") from e
 
 
 def get_ai_usage() -> dict:
@@ -247,6 +290,11 @@ class TimelineInput(_CoercedModel):
     date_end: str = ""      # YYYY-MM-DD(區間才有,如擴廠→量產)
     event_type: str = ""    # 需為時程庫合法類型之一
     note: str = ""          # 補充備註
+
+
+class TimelineBatch(_CoercedModel):
+    """「時程」批次多行:一次 AI 呼叫拆多筆,events 順序對應輸入的每一行(結構化輸出用)。"""
+    events: List[TimelineInput] = []
 
 
 class StockNews(_CoercedModel):
@@ -928,22 +976,8 @@ def _analyze(cfg: CategoryConfig, title: str, content: str):
                 + "、".join(whitelist)
             )
 
-    last_err = None
-    for _ in range(2):
-        try:
-            completion = _ai_chat(
-                model=AI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=2000,
-            )
-            raw = completion.choices[0].message.content or ""
-            return cfg.model.model_validate(_safe_json_loads(raw))
-        except (json.JSONDecodeError, ValidationError) as e:
-            last_err = e
-    raise RuntimeError(f"AI 回傳格式解析失敗(已重試):{last_err}")
+    # 結構化輸出:API 端保證回傳符合 cfg.model 的 JSON,不必再自己剝 JSON/重試解析
+    return _ai_chat(system_prompt, user_prompt, max_tokens=8000, output_model=cfg.model)
 
 
 def _safe_json_loads(text: str) -> dict:
@@ -1209,22 +1243,7 @@ def _parse_timeline(body: str) -> TimelineInput:
 只回傳這個結構的 JSON:
 {{"stock_code":"","stock_name":"","title":"","date_start":"","date_end":"","event_type":"","note":""}}
 """
-    last_err = None
-    for _ in range(2):
-        try:
-            completion = _ai_chat(
-                model=AI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=600,
-            )
-            raw = completion.choices[0].message.content or ""
-            return TimelineInput.model_validate(_safe_json_loads(raw))
-        except (json.JSONDecodeError, ValidationError) as e:
-            last_err = e
-    raise RuntimeError(f"AI 解析時程失敗(已重試):{last_err}")
+    return _ai_chat(system_prompt, user_prompt, max_tokens=4000, output_model=TimelineInput)
 
 
 def _parse_timeline_many(bodies: List[str]) -> List[TimelineInput]:
@@ -1255,23 +1274,14 @@ def _parse_timeline_many(bodies: List[str]) -> List[TimelineInput]:
 嚴格回傳這個結構(events 陣列長度必須等於 {len(bodies)},順序對應每一行):
 {{"events":[{{"stock_code":"","stock_name":"","title":"","date_start":"","date_end":"","event_type":"","note":""}}]}}
 """
-    for _ in range(2):
-        try:
-            completion = _ai_chat(
-                model=AI_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=300 * len(bodies) + 300,
-            )
-            raw = completion.choices[0].message.content or ""
-            obj = _safe_json_loads(raw)
-            events = obj.get("events") if isinstance(obj, dict) else None
-            if isinstance(events, list) and len(events) == len(bodies):
-                return [TimelineInput.model_validate(e) for e in events]
-        except (json.JSONDecodeError, ValidationError, KeyError, TypeError, AttributeError):
-            pass
+    try:
+        batch = _ai_chat(system_prompt, user_prompt,
+                         max_tokens=3000 + 600 * len(bodies), output_model=TimelineBatch)
+        if len(batch.events) == len(bodies):
+            return list(batch.events)
+        logger.warning("批次時程筆數對不上(要 %d 得 %d),改逐行解析", len(bodies), len(batch.events))
+    except (RuntimeError, ValidationError) as e:
+        logger.warning("批次時程解析失敗,改逐行解析:%s", e)
     # 一次拆多筆失敗 → 退回逐行解析(較慢但保證每行有結果)
     return [_parse_timeline(b) for b in bodies]
 
@@ -1982,15 +1992,7 @@ def _answer_query(question: str) -> Result:
         f"以下是使用者 Notion 投資筆記資料庫(較新的在前):\n\n{corpus}\n\n"
         f"---\n使用者的問題:{question}\n\n請只根據上面的資料庫內容回答。"
     )
-    completion = _ai_chat(
-        model=AI_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        max_tokens=1200,
-    )
-    answer = (completion.choices[0].message.content or "").strip() or "(沒有得到回應,請再試一次)"
+    answer = _ai_chat(system_prompt, user_prompt, max_tokens=8000).strip() or "(沒有得到回應,請再試一次)"
     return Result(label="查詢", reply=f"🔍 {question}\n\n{answer}"[:4500])
 
 
